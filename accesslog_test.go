@@ -233,6 +233,30 @@ func TestAccessLoggerFallbackMetadataAnd404(t *testing.T) {
 	if _, ok := entry["path_template"]; ok {
 		t.Fatalf("unmatched route emitted path_template: %#v", entry)
 	}
+	if _, ok := entry["operation_id"]; ok {
+		t.Fatalf("unmatched route emitted operation_id: %#v", entry)
+	}
+}
+
+func TestAccessLogger405OmitsSyntheticRouteMetadata(t *testing.T) {
+	t.Parallel()
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	e := echo.New()
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	e.GET("/users/:id", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/users/123", nil))
+	entry := decodeSingleLogLine(t, buffer.String())
+	if rec.Code != http.StatusMethodNotAllowed || entry["status"] != float64(http.StatusMethodNotAllowed) {
+		t.Fatalf("unexpected 405 response: code=%d entry=%#v", rec.Code, entry)
+	}
+	if entry["path_template"] != "/users/:id" {
+		t.Fatalf("method-not-allowed route lost matched path_template: %#v", entry)
+	}
+	if _, ok := entry["operation_id"]; ok {
+		t.Fatalf("method-not-allowed route emitted operation_id: %#v", entry)
+	}
 }
 
 func TestAccessLoggerNilBaseLoggerDoesNotPanic(t *testing.T) {
@@ -289,6 +313,39 @@ func TestAccessLoggerLogsAndRethrowsPanic(t *testing.T) {
 	}
 	entry := decodeSingleLogLine(t, buffer.String())
 	assertFields(t, entry, map[string]any{"status": float64(http.StatusInternalServerError), "level": "ERROR"})
+}
+
+func TestAccessLoggerPreservesCommittedStatusAndRethrowsPanic(t *testing.T) {
+	t.Parallel()
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	e := echo.New()
+	recorder := httptest.NewRecorder()
+	c := e.NewContext(
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/panic", nil),
+		recorder,
+	)
+	handler := AccessLogger(AccessLoggerConfig{Logger: logger})(func(c *echo.Context) error {
+		if err := c.NoContent(http.StatusAccepted); err != nil {
+			return err
+		}
+		panic("boom")
+	})
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		if err := handler(c); err != nil {
+			t.Fatalf("handler returned error before panic: %v", err)
+		}
+	}()
+	if recovered != "boom" {
+		t.Fatalf("recovered = %#v", recovered)
+	}
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("wire status = %d, want %d", recorder.Code, http.StatusAccepted)
+	}
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{"status": float64(http.StatusAccepted), "level": "INFO"})
 }
 
 func TestAccessLoggerCloudPresets(t *testing.T) {

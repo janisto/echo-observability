@@ -5,7 +5,9 @@
 - Add Echo v5 request-context middleware with validated/generated request IDs,
   W3C trace correlation, and standard context propagation.
 - Add structured Zap access logging with route templates, explicit route names,
-  returned-error status resolution, panic rethrow, and custom fields.
+  returned-error status resolution, panic rethrow, and custom fields. Synthetic
+  Echo 404/405 route names are excluded, and committed wire statuses are
+  preserved when a handler subsequently panics.
 - Add standard `net/http` request-context middleware for mixed Echo/router services.
 - Add generic, Google Cloud, AWS, and Azure logger presets.
 - Honor Echo's configured `IPExtractor` and scheme resolution in access logs.

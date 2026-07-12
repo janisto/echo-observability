@@ -245,8 +245,9 @@ centralized HTTP error handler. `echo.ResolveResponseStatus` determines the
 status: a committed response wins, then an `HTTPStatusCoder`, then 500 for a
 plain error.
 
-On panic, `AccessLogger` emits a 500 line and re-panics. Recovery must be
-inside it:
+On panic, `AccessLogger` logs 500 for an uncommitted response and re-panics. If
+the response is already committed, the log preserves its wire status. Recovery
+must be inside it:
 
 ```go
 e.Use(

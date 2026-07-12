@@ -389,8 +389,10 @@ secrets and personal data.
 
 ## Panic Behavior
 
-`AccessLogger` recovers a panic only long enough to emit a 500 access log, then
-re-panics with the original value. Install the application's recovery
+`AccessLogger` recovers a panic only long enough to emit an access log, then
+re-panics with the original value. An uncommitted response is logged as 500. If
+the response was already committed, its wire status is preserved in the log.
+Install the application's recovery
 middleware inside it—later in the `e.Use` list—when the application must turn
 panics into HTTP responses. The package never swallows a panic or owns the
 response format.

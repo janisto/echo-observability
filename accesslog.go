@@ -41,10 +41,7 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 
 			defer func() {
 				panicValue := recover()
-				status := http.StatusInternalServerError
-				if panicValue == nil {
-					_, status = echo.ResolveResponseStatus(c.Response(), err)
-				}
+				status := accessLogStatus(c.Response(), err, panicValue != nil)
 				duration := max(cfg.Now().Sub(start), 0)
 				fields := accessLogFields(c, status, duration, cfg.Preset)
 				if err != nil {
@@ -62,6 +59,14 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 			return next(c)
 		}
 	}
+}
+
+func accessLogStatus(response http.ResponseWriter, err error, panicked bool) int {
+	resp, status := echo.ResolveResponseStatus(response, err)
+	if panicked && (resp == nil || !resp.Committed) {
+		return http.StatusInternalServerError
+	}
+	return status
 }
 
 func normalizeAccessLoggerConfig(config AccessLoggerConfig) AccessLoggerConfig {
@@ -159,7 +164,7 @@ func accessLogFields(c *echo.Context, status int, duration time.Duration, preset
 		fields = append(fields, zap.String("path_template", pathTemplate))
 	}
 	route := c.RouteInfo()
-	if routeName := route.Name; routeName != "" && routeName != route.Method+":"+route.Path {
+	if routeName := route.Name; isExplicitRouteName(routeName, route.Method, route.Path) {
 		fields = append(fields, zap.String("operation_id", routeName))
 	}
 	if remote != "" {
@@ -179,6 +184,13 @@ func accessLogFields(c *echo.Context, status int, duration time.Duration, preset
 		}))
 	}
 	return fields
+}
+
+func isExplicitRouteName(name, method, path string) bool {
+	return name != "" &&
+		name != echo.NotFoundRouteName &&
+		name != echo.MethodNotAllowedRouteName &&
+		name != method+":"+path
 }
 
 func appendExtraFields(fields, extra []zap.Field) []zap.Field {
