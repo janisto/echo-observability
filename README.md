@@ -336,12 +336,10 @@ set: letters, digits, `-`, `.`, `_`, and `~`. Invalid client input is replaced,
 never copied to response headers or logs. Applications may supply both
 `NewRequestID` and `ValidateRequestID` when they need a different contract.
 
-## `echo-playground` Adoption
+## Middleware Placement
 
-The current `echo-playground` middleware stack has separate request ID,
-request-scoped `slog`, and access logger middleware. After its application
-logging moves to Zap, replace those three middlewares with this pair at the
-outer observability boundary:
+Install request context and access logging at the outer observability boundary
+so downstream middleware failures are correlated and logged:
 
 ```go
 e.Use(
@@ -353,21 +351,15 @@ e.Use(
 		Logger: logger,
 		Preset: obs.PresetGCP,
 	}),
-	appmiddleware.Security("/api-docs"),
-	appmiddleware.Vary(),
-	appmiddleware.CORS(),
+	middleware.CORS(),
 	middleware.BodyLimit(1<<20),
-	respond.Recoverer(),
+	middleware.Recover(),
 )
 ```
 
-Replace `c.Get("request_id")` with `obs.RequestID(c.Request().Context())` and
-replace local request-scoped logging helpers with
-`obs.Logger(c.Request().Context())`. Echo's own `e.Logger` remains an
-`*slog.Logger` in Echo v5 and is separate from application request logging.
-
-See [EXAMPLES.md](EXAMPLES.md) for a complete playground-oriented setup and
-cloud-specific configuration.
+Read request metadata with `obs.RequestID(c.Request().Context())` and log with
+`obs.Logger(c.Request().Context())`. Echo's own `e.Logger` remains separate
+from application request logging.
 
 Configure `e.IPExtractor` for the real deployment topology before serving
 requests. `AccessLogger` uses Echo's resolved client IP and therefore inherits
@@ -386,7 +378,7 @@ base logger before passing it to middleware:
 
 ```go
 logger = logger.With(
-	zap.String("service", "echo-playground"),
+	zap.String("service", "example-api"),
 	zap.String("environment", "production"),
 	zap.String("version", version),
 )

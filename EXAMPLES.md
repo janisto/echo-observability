@@ -59,10 +59,10 @@ The inner Echo middleware reuses the outer metadata. `HTTPRequestContext`
 does not write access logs, so Echo routes still produce exactly one access
 line from `AccessLogger`.
 
-## Echo Playground Migration
+## Existing Service Integration
 
-After `echo-playground` moves its application logging to Zap, replace its
-local request ID, request logger, and access logger middleware with:
+Place the observability middleware outside other fallible middleware so their
+rejected requests receive request IDs and access logs:
 
 ```go
 e.Use(
@@ -74,18 +74,15 @@ e.Use(
 		Logger: logger,
 		Preset: obs.PresetGCP,
 	}),
-	appmiddleware.Security("/api-docs"),
-	appmiddleware.Vary(),
-	appmiddleware.CORS(),
+	middleware.CORS(),
 	middleware.BodyLimit(1<<20),
-	respond.Recoverer(),
+	middleware.Recover(),
 )
 ```
 
-Use `obs.RequestID(c.Request().Context())` instead of `c.Get("request_id")`.
-Application logging becomes `obs.Logger(ctx).Info(...)`. Echo's internal
-`e.Logger` remains its required `*slog.Logger`; it is not the application
-request logger.
+Use `obs.RequestID(c.Request().Context())` for the request ID and
+`obs.Logger(ctx).Info(...)` for application logging. Echo's internal logger is
+separate from the application request logger.
 
 Set `e.IPExtractor` for the actual proxy topology. Access logs use
 `c.RealIP()`, exactly like Echo's request logger.
@@ -101,7 +98,7 @@ Use stable field names across services:
 
 | Variable | Log field | Example |
 | --- | --- | --- |
-| `SERVICE_NAME` | `service` | `echo-playground` |
+| `SERVICE_NAME` | `service` | `example-api` |
 | `SERVICE_ENV` | `environment` | `local`, `staging`, `prod` |
 | `SERVICE_VERSION` | `version` | release tag, image tag, or commit SHA |
 | `PORT` | none | `8080` |
@@ -255,7 +252,7 @@ inside it:
 e.Use(
 	obs.RequestContext(obs.RequestContextConfig{Logger: logger}),
 	obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger}),
-	respond.Recoverer(),
+	middleware.Recover(),
 )
 ```
 
