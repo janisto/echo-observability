@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.0 - 2026-07-12
 
 - Add Echo v5 request-context middleware with validated/generated request IDs,
   W3C trace correlation, and standard context propagation.
