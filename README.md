@@ -47,6 +47,10 @@ go get github.com/janisto/echo-observability
 
 ## Quick Start
 
+When this documentation shows one configuration, it uses GCP. Complete
+runnable GCP, provider-neutral, AWS, and Azure applications are available in
+[`examples`](examples).
+
 ```go
 package main
 
@@ -61,15 +65,15 @@ import (
 )
 
 func main() {
-	logger, err := obs.NewLogger(obs.LoggerConfig{})
+	logger, err := obs.NewLogger(obs.LoggerConfig{Preset: obs.PresetGCP})
 	if err != nil {
 		panic(err)
 	}
 
 	e := echo.New()
 	e.Use(
-		obs.RequestContext(obs.RequestContextConfig{Logger: logger}),
-		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger}),
+		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: obs.PresetGCP}),
+		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger, Preset: obs.PresetGCP}),
 		middleware.Recover(),
 	)
 
@@ -144,7 +148,7 @@ mux.HandleFunc("GET /ready", readyHandler)
 
 handler := obs.HTTPRequestContext(obs.HTTPRequestContextConfig{
 	Logger: logger,
-	Preset: obs.PresetDefault,
+	Preset: obs.PresetGCP,
 })(mux)
 ```
 
@@ -213,6 +217,7 @@ provider-owned field names are ignored to prevent duplicate JSON keys.
 ```go
 e.Use(obs.AccessLogger(obs.AccessLoggerConfig{
 	Logger: logger,
+	Preset: obs.PresetGCP,
 	ExtraFields: func(c *echo.Context) []zap.Field {
 		return []zap.Field{zap.String("tenant_id", tenantID(c))}
 	},
