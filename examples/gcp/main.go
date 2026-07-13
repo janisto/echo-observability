@@ -2,8 +2,6 @@ package main
 
 import (
 	"net/http"
-	"os"
-	"time"
 
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
@@ -12,65 +10,24 @@ import (
 	"github.com/janisto/echo-observability"
 )
 
-func setup(e *echo.Echo) (*zap.Logger, error) {
+func main() {
 	logger, err := obs.NewLogger(obs.LoggerConfig{Preset: obs.PresetGCP})
 	if err != nil {
-		return nil, err
+		panic(err)
 	}
-	logger = logger.With(projectFields()...)
+
+	e := echo.New()
 	e.Use(
-		obs.RequestContext(obs.RequestContextConfig{
-			Logger: logger, Preset: obs.PresetGCP,
-		}),
-		obs.AccessLogger(obs.AccessLoggerConfig{
-			Logger: logger, Preset: obs.PresetGCP,
-		}),
+		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: obs.PresetGCP}),
+		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger, Preset: obs.PresetGCP}),
 		middleware.Recover(),
 	)
 	e.GET("/health", func(c *echo.Context) error {
 		obs.Logger(c.Request().Context()).Info("health check")
 		return c.JSON(http.StatusOK, map[string]bool{"ok": true})
 	})
-	return logger, nil
-}
 
-func main() {
-	e := echo.New()
-	logger, err := setup(e)
-	if err != nil {
-		panic(err)
+	if err := e.Start(":8080"); err != nil {
+		logger.Error("server stopped", zap.Error(err))
 	}
-	mux := http.NewServeMux()
-	mux.Handle("/", e)
-	mux.HandleFunc("GET /ready", func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusNoContent)
-		obs.Logger(r.Context()).Info("readiness check")
-	})
-	handler := obs.HTTPRequestContext(obs.HTTPRequestContextConfig{
-		Logger: logger, Preset: obs.PresetGCP,
-	})(mux)
-	server := &http.Server{
-		Addr:              ":" + envOrDefault("PORT", "8080"),
-		Handler:           handler,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
-	panic(server.ListenAndServe())
-}
-
-func projectFields() []zap.Field {
-	return []zap.Field{
-		zap.String("service", envOrDefault("SERVICE_NAME", "echo-example")),
-		zap.String("environment", envOrDefault("SERVICE_ENV", "local")),
-		zap.String("version", envOrDefault("SERVICE_VERSION", "dev")),
-		zap.String("cloud_provider", "gcp"),
-		zap.String("cloud_project", os.Getenv("GOOGLE_CLOUD_PROJECT")),
-		zap.String("cloud_location", os.Getenv("GOOGLE_CLOUD_LOCATION")),
-	}
-}
-
-func envOrDefault(name, fallback string) string {
-	if value := os.Getenv(name); value != "" {
-		return value
-	}
-	return fallback
 }
