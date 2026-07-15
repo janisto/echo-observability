@@ -1,5 +1,11 @@
 # echo-observability
 
+[![CI](https://img.shields.io/github/actions/workflow/status/janisto/echo-observability/ci.yml?branch=main&label=CI)](https://github.com/janisto/echo-observability/actions/workflows/ci.yml)
+[![Go Reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/janisto/echo-observability)
+[![GitHub release](https://img.shields.io/github/v/release/janisto/echo-observability)](https://github.com/janisto/echo-observability/releases/latest)
+[![Go version](https://img.shields.io/github/go-mod/go-version/janisto/echo-observability)](go.mod)
+[![License](https://img.shields.io/github/license/janisto/echo-observability)](LICENSE)
+
 `echo-observability` provides request correlation, request-scoped Zap loggers,
 and structured Zap access logging middleware for
 [Labstack Echo v5](https://github.com/labstack/echo).
