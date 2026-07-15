@@ -4,28 +4,40 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
+
+type failingWriter struct {
+	err error
+}
+
+func (w failingWriter) Write([]byte) (int, error) {
+	return 0, w.err
+}
 
 func TestNewLoggerPresets(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
+		name   string
 		preset Preset
 		key    string
 		value  string
 	}{
-		{PresetDefault, "level", "INFO"},
-		{PresetGCP, "severity", "INFO"},
-		{PresetAWS, "level", "INFO"},
-		{PresetAzure, "level", "INFO"},
+		{"default", PresetDefault, "level", "INFO"},
+		{"gcp", PresetGCP, "severity", "INFO"},
+		{"aws", PresetAWS, "level", "INFO"},
+		{"azure", PresetAzure, "level", "INFO"},
 	}
 	for _, tt := range tests {
-		t.Run(string(tt.preset), func(t *testing.T) {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var buffer bytes.Buffer
 			logger, err := NewLogger(LoggerConfig{Preset: tt.preset, Writer: &buffer})
@@ -37,6 +49,13 @@ func TestNewLoggerPresets(t *testing.T) {
 			if entry[tt.key] != tt.value || entry["message"] != "hello" || entry["component"] != "test" {
 				t.Fatalf("unexpected entry: %#v", entry)
 			}
+			otherLevelKey := "severity"
+			if tt.key == "severity" {
+				otherLevelKey = "level"
+			}
+			if _, ok := entry[otherLevelKey]; ok {
+				t.Fatalf("unexpected %s in entry: %#v", otherLevelKey, entry)
+			}
 			if _, ok := entry["timestamp"].(string); !ok {
 				t.Fatalf("timestamp missing: %#v", entry)
 			}
@@ -46,8 +65,9 @@ func TestNewLoggerPresets(t *testing.T) {
 
 func TestNewLoggerRejectsUnknownPreset(t *testing.T) {
 	t.Parallel()
-	if _, err := NewLogger(LoggerConfig{Preset: "bogus"}); err == nil {
-		t.Fatal("NewLogger accepted an unknown preset")
+	logger, err := NewLogger(LoggerConfig{Preset: "bogus"})
+	if logger != nil || err == nil || err.Error() != "observability: unknown logger preset" {
+		t.Fatalf("NewLogger(bogus) = (%#v, %v), want nil and exact unknown-preset error", logger, err)
 	}
 }
 
@@ -66,10 +86,13 @@ func TestNewLoggerWritesNamedLoggerField(t *testing.T) {
 
 func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 	t.Parallel()
-	for _, trace := range []TraceContext{{}, {
-		TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
-		Flags: "01", Sampled: true, Valid: true,
-	}} {
+	for _, trace := range []TraceContext{
+		{},
+		{
+			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
+			Flags: "01", Sampled: true, Valid: true,
+		},
+	} {
 		var buffer bytes.Buffer
 		base, err := NewLogger(LoggerConfig{Writer: &buffer})
 		if err != nil {
@@ -79,12 +102,26 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 			RequestID: "req-1", CorrelationID: "corr-1", Trace: trace,
 		})...).Info("handler")
 		entry := decodeSingleLogLine(t, buffer.String())
-		_, hasTraceID := entry["trace_id"]
-		if hasTraceID != trace.Valid {
-			t.Fatalf("trace_id present=%v valid=%v entry=%#v", hasTraceID, trace.Valid, entry)
+		if entry["request_id"] != "req-1" || entry["correlation_id"] != "corr-1" {
+			t.Fatalf("request metadata fields = %#v", entry)
 		}
-		if trace.Valid && entry["trace_sampled"] != true {
-			t.Fatalf("trace fields = %#v", entry)
+		traceFields := []string{"trace_id", "parent_id", "trace_flags", "trace_sampled"}
+		if !trace.Valid {
+			for _, key := range traceFields {
+				if _, ok := entry[key]; ok {
+					t.Fatalf("invalid trace emitted %s: %#v", key, entry)
+				}
+			}
+			continue
+		}
+		want := map[string]any{
+			"trace_id": trace.TraceID, "parent_id": trace.ParentID,
+			"trace_flags": trace.Flags, "trace_sampled": trace.Sampled,
+		}
+		for key, value := range want {
+			if entry[key] != value {
+				t.Fatalf("%s = %#v, want %#v; entry=%#v", key, entry[key], value, entry)
+			}
 		}
 	}
 }
@@ -92,24 +129,68 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 func TestGCPLevelMapping(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		log  func(*zap.Logger)
-		want string
+		level zapcore.Level
+		want  string
 	}{
-		{func(l *zap.Logger) { l.Debug("level") }, "DEBUG"},
-		{func(l *zap.Logger) { l.Info("level") }, "INFO"},
-		{func(l *zap.Logger) { l.Warn("level") }, "WARNING"},
-		{func(l *zap.Logger) { l.Error("level") }, "ERROR"},
+		{zapcore.DebugLevel, "DEBUG"},
+		{zapcore.InfoLevel, "INFO"},
+		{zapcore.WarnLevel, "WARNING"},
+		{zapcore.ErrorLevel, "ERROR"},
+		{zapcore.DPanicLevel, "CRITICAL"},
+		{zapcore.PanicLevel, "ALERT"},
+		{zapcore.FatalLevel, "EMERGENCY"},
 	}
 	for _, tt := range tests {
-		var buffer bytes.Buffer
-		logger, err := NewLogger(LoggerConfig{Preset: PresetGCP, Writer: &buffer, Level: zap.DebugLevel})
+		encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
+			LevelKey:    "severity",
+			MessageKey:  "message",
+			LineEnding:  zapcore.DefaultLineEnding,
+			EncodeLevel: gcpLevelEncoder,
+		})
+		buffer, err := encoder.EncodeEntry(zapcore.Entry{Level: tt.level, Message: "level"}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
-		tt.log(logger)
-		if got := decodeSingleLogLine(t, buffer.String())["severity"]; got != tt.want {
+		entry := decodeSingleLogLine(t, buffer.String())
+		buffer.Free()
+		if got := entry["severity"]; got != tt.want {
 			t.Fatalf("severity = %v, want %s", got, tt.want)
 		}
+	}
+}
+
+func TestLoggerTimestampIsUTC(t *testing.T) {
+	t.Parallel()
+	encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
+		TimeKey:    "timestamp",
+		LineEnding: zapcore.DefaultLineEnding,
+		EncodeTime: utcRFC3339NanoTimeEncoder,
+	})
+	entryTime := time.Date(2026, 7, 15, 12, 34, 56, 123456789, time.FixedZone("UTC+3", 3*60*60))
+	buffer, err := encoder.EncodeEntry(zapcore.Entry{Time: entryTime}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := decodeSingleLogLine(t, buffer.String())
+	buffer.Free()
+	if got := entry["timestamp"]; got != "2026-07-15T09:34:56.123456789Z" {
+		t.Fatalf("timestamp = %v", got)
+	}
+}
+
+func TestNewLoggerReportsSinkFailuresToErrorWriter(t *testing.T) {
+	t.Parallel()
+	var errorOutput bytes.Buffer
+	logger, err := NewLogger(LoggerConfig{
+		Writer:      failingWriter{err: errors.New("sink unavailable")},
+		ErrorWriter: &errorOutput,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.Info("lost log")
+	if output := errorOutput.String(); !strings.Contains(output, "write error: sink unavailable") {
+		t.Fatalf("error output = %q", output)
 	}
 }
 
@@ -132,22 +213,60 @@ func TestNewLoggerConcurrentWrites(t *testing.T) {
 	wg.Wait()
 	lines := strings.Split(strings.TrimSpace(buffer.String()), "\n")
 	if len(lines) != goroutines*writes {
-		t.Fatalf("line count = %d", len(lines))
+		t.Fatalf("line count = %d, want %d", len(lines), goroutines*writes)
 	}
+	seen := make(map[[2]int]struct{}, goroutines*writes)
 	for _, line := range lines {
 		var entry map[string]any
 		if err := json.Unmarshal([]byte(line), &entry); err != nil {
 			t.Fatalf("invalid JSON: %v", err)
 		}
+		if entry["message"] != "concurrent" || entry["level"] != "INFO" {
+			t.Fatalf("unexpected concurrent entry contract: %#v", entry)
+		}
+		workerValue, workerOK := entry["worker"].(float64)
+		writeValue, writeOK := entry["write"].(float64)
+		worker, write := int(workerValue), int(writeValue)
+		if !workerOK || !writeOK || float64(worker) != workerValue || float64(write) != writeValue ||
+			worker < 0 || worker >= goroutines || write < 0 || write >= writes {
+			t.Fatalf("invalid worker/write pair: %#v", entry)
+		}
+		pair := [2]int{worker, write}
+		if _, duplicate := seen[pair]; duplicate {
+			t.Fatalf("duplicate worker/write pair %v", pair)
+		}
+		seen[pair] = struct{}{}
+	}
+	if len(seen) != goroutines*writes {
+		t.Fatalf("unique worker/write pairs = %d, want %d", len(seen), goroutines*writes)
 	}
 }
 
-func TestLoggerAccessor(t *testing.T) {
+func TestLoggerWithoutRequestMetadataIsNoop(t *testing.T) {
 	t.Parallel()
-	//lint:ignore SA1012 Nil is part of the accessor contract under test.
-	if Logger(nil) == nil || Logger(context.Background()) == nil { //nolint:staticcheck // verifies nil-safety contract
-		t.Fatal("Logger returned nil")
+	contexts := []struct {
+		name string
+		ctx  context.Context
+	}{
+		{name: "nil"},
+		{name: "background", ctx: context.Background()},
 	}
+	for _, tt := range contexts {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			logger := Logger(tt.ctx)
+			if logger == nil {
+				t.Fatal("Logger returned nil without request metadata")
+			}
+			if logger.Core().Enabled(zap.InfoLevel) || logger.Check(zap.InfoLevel, "must be discarded") != nil {
+				t.Fatal("Logger without request metadata was not a no-op")
+			}
+		})
+	}
+}
+
+func TestLoggerReturnsInstalledRequestLogger(t *testing.T) {
+	t.Parallel()
 	var buffer bytes.Buffer
 	base, err := NewLogger(LoggerConfig{Writer: &buffer})
 	if err != nil {
@@ -158,7 +277,8 @@ func TestLoggerAccessor(t *testing.T) {
 		Logger:    base.With(zap.String("request_id", "req-1")),
 	})
 	Logger(ctx).Info("handler")
-	if entry := decodeSingleLogLine(t, buffer.String()); entry["request_id"] != "req-1" {
+	entry := decodeSingleLogLine(t, buffer.String())
+	if entry["message"] != "handler" || entry["request_id"] != "req-1" {
 		t.Fatalf("unexpected entry: %#v", entry)
 	}
 }

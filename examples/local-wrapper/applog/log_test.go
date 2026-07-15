@@ -40,9 +40,21 @@ func TestHelpersUseRequestScopedLoggerAndMetadata(t *testing.T) {
 	req.Header.Set("Traceparent", "00-"+traceID+"-00f067aa0ba902b7-01")
 	e.ServeHTTP(httptest.NewRecorder(), req)
 	logs := decodeLogLines(t, buffer.String())
+	if len(logs) != 5 {
+		t.Fatalf("log count = %d, want one line per helper: %#v", len(logs), logs)
+	}
+	for _, entry := range logs {
+		for key, want := range map[string]any{
+			"request_id": "req-wrapper", "correlation_id": traceID, "trace_id": traceID,
+			"trace_sampled": true,
+		} {
+			if entry[key] != want {
+				t.Fatalf("%s = %#v, want %#v in %#v", key, entry[key], want, entry)
+			}
+		}
+	}
 	assertLog(t, logs, "debug helper", "DEBUG", map[string]any{
-		"request_id": "req-wrapper", "correlation_id": traceID, "trace_id": traceID,
-		"trace_sampled": true, "debug_field": "yes",
+		"debug_field": "yes",
 	})
 	assertLog(t, logs, "info helper", "INFO", map[string]any{"info_field": "yes"})
 	assertLog(t, logs, "warn helper", "WARN", map[string]any{"warn_field": "yes"})
@@ -52,13 +64,27 @@ func TestHelpersUseRequestScopedLoggerAndMetadata(t *testing.T) {
 
 func TestWithErrorPrependsWithoutMutatingFields(t *testing.T) {
 	t.Parallel()
-	fields := []zap.Field{zap.String("component", "worker")}
-	got := withError(errors.New("boom"), fields)
-	if len(got) != 2 || got[0].Key != "error" || got[1].Key != "component" || fields[0].Key != "component" {
+	boom := errors.New("boom")
+	backing := []zap.Field{
+		zap.String("component", "worker"),
+		zap.String("sentinel", "unchanged"),
+	}
+	fields := backing[:1]
+	got := withError(boom, fields)
+	if len(got) != 2 {
+		t.Fatalf("fields = %#v, want error followed by input field", got)
+	}
+	gotError, isError := got[0].Interface.(error)
+	if got[0].Key != "error" || !isError || !errors.Is(gotError, boom) ||
+		got[1].Key != "component" || got[1].String != "worker" {
 		t.Fatalf("fields = %#v input = %#v", got, fields)
 	}
+	if backing[0].Key != "component" || backing[0].String != "worker" ||
+		backing[1].Key != "sentinel" || backing[1].String != "unchanged" {
+		t.Fatalf("input backing array was mutated: %#v", backing)
+	}
 	withoutErr := withError(nil, fields)
-	if len(withoutErr) != 1 || withoutErr[0].Key != "component" {
+	if len(withoutErr) != 1 || withoutErr[0].Key != "component" || withoutErr[0].String != "worker" {
 		t.Fatalf("without error = %#v", withoutErr)
 	}
 }

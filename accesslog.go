@@ -41,19 +41,41 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 
 			defer func() {
 				panicValue := recover()
-				status := accessLogStatus(c.Response(), err, panicValue != nil)
-				duration := max(cfg.Now().Sub(start), 0)
-				fields := accessLogFields(c, status, duration, cfg.Preset)
-				if err != nil {
-					fields = append(fields, zap.Error(err))
+				writeAccessLog := func() {
+					status := accessLogStatus(c.Response(), err, panicValue != nil)
+					if logger == nil {
+						logger = noopLogger
+					}
+					entry := logger.Check(cfg.StatusLevel(status), "request completed")
+					if entry == nil {
+						return
+					}
+					duration := max(cfg.Now().Sub(start), 0)
+					fields := accessLogFields(c, status, duration, cfg.Preset)
+					if err != nil {
+						fields = append(fields, zap.Error(err))
+					}
+					if cfg.ExtraFields != nil {
+						fields = appendExtraFields(fields, cfg.ExtraFields(c))
+					}
+					entry.Write(fields...)
 				}
-				if cfg.ExtraFields != nil {
-					fields = appendExtraFields(fields, cfg.ExtraFields(c))
+				if panicValue == nil {
+					writeAccessLog()
+					return
 				}
-				logAt(logger, cfg.StatusLevel(status), "request completed", fields...)
-				if panicValue != nil {
-					panic(panicValue)
-				}
+
+				// Preserve the handler's original panic even if access-log
+				// enrichment or writing panics while the stack is unwinding.
+				func() {
+					defer func() {
+						if recover() != nil {
+							panic(panicValue)
+						}
+					}()
+					writeAccessLog()
+				}()
+				panic(panicValue)
 			}()
 
 			return next(c)
@@ -92,15 +114,6 @@ func DefaultStatusLevel(status int) zapcore.Level {
 		return zapcore.WarnLevel
 	default:
 		return zapcore.InfoLevel
-	}
-}
-
-func logAt(logger *zap.Logger, level zapcore.Level, msg string, fields ...zap.Field) {
-	if logger == nil {
-		logger = noopLogger
-	}
-	if entry := logger.Check(level, msg); entry != nil {
-		entry.Write(fields...)
 	}
 }
 

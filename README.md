@@ -213,6 +213,8 @@ middleware.
 
 Use `ExtraFields` for application-owned access-log fields. Package-owned and
 provider-owned field names are ignored to prevent duplicate JSON keys.
+`ExtraFields` is evaluated only when the selected access-log level is enabled,
+so suppressed logs do not run application enrichment callbacks.
 
 ```go
 e.Use(obs.AccessLogger(obs.AccessLoggerConfig{
@@ -397,6 +399,8 @@ secrets and personal data.
 `AccessLogger` recovers a panic only long enough to emit an access log, then
 re-panics with the original value. An uncommitted response is logged as 500. If
 the response was already committed, its wire status is preserved in the log.
+If access-log enrichment or writing also panics while the handler panic is
+unwinding, the original handler panic remains the value propagated downstream.
 Install the application's recovery
 middleware inside it—later in the `e.Use` list—when the application must turn
 panics into HTTP responses. The package never swallows a panic or owns the
