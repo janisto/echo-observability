@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add a repository-local adversarial-testing skill and strengthen regression
+  coverage for boundaries, failure side effects, concurrency, request metadata,
+  and W3C trace parsing.
+- Avoid running access-log enrichment callbacks for disabled log levels, and
+  preserve the original handler panic if access-log enrichment or writing also
+  panics while the handler stack is unwinding.
+
 ## v0.1.0 - 2026-07-12
 
 - Add Echo v5 request-context middleware with validated/generated request IDs,

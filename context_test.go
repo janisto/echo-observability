@@ -3,6 +3,7 @@ package obs
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -12,44 +13,93 @@ import (
 	"go.uber.org/zap"
 )
 
-func TestDefaultValidateRequestID(t *testing.T) {
+func TestDefaultValidateRequestIDEnforcesASCIIAndLengthBoundaries(t *testing.T) {
 	t.Parallel()
-	tests := map[string]bool{
-		"abc-XYZ_123.~":          true,
-		"":                       false,
-		strings.Repeat("a", 129): false,
-		"abc def":                false,
-		"abc/def":                false,
-		"å":                      false,
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{name: "allowed character boundaries", value: "azAZ09-._~", want: true},
+		{name: "maximum length", value: strings.Repeat("a", 128), want: true},
+		{name: "empty", value: ""},
+		{name: "over maximum length", value: strings.Repeat("a", 129)},
+		{name: "before lowercase", value: "`"},
+		{name: "after lowercase", value: "{"},
+		{name: "before uppercase", value: "@"},
+		{name: "after uppercase", value: "["},
+		{name: "before digit", value: "/"},
+		{name: "after digit", value: ":"},
+		{name: "embedded space", value: "abc def"},
+		{name: "embedded slash", value: "abc/def"},
+		{name: "non ASCII", value: "å"},
 	}
-	for value, want := range tests {
-		if got := DefaultValidateRequestID(value); got != want {
-			t.Errorf("DefaultValidateRequestID(%q) = %v, want %v", value, got, want)
+	for _, tt := range tests {
+		if got := DefaultValidateRequestID(tt.value); got != tt.want {
+			t.Errorf("%s: DefaultValidateRequestID(%q) = %v, want %v", tt.name, tt.value, got, tt.want)
 		}
+	}
+}
+
+func TestRequestContextUsesCustomValidatorAndDefaultsResponseHeader(t *testing.T) {
+	t.Parallel()
+	const header = "X-Custom-Request-Id"
+	const generated = "custom:id"
+
+	e := echo.New()
+	e.Use(RequestContext(RequestContextConfig{
+		RequestIDHeader: header,
+		NewRequestID:    func() string { return generated },
+		ValidateRequestID: func(value string) bool {
+			return strings.HasPrefix(value, "custom:")
+		},
+	}))
+	var got string
+	e.GET("/", func(c *echo.Context) error {
+		got = RequestID(c.Request().Context())
+		return c.NoContent(http.StatusNoContent)
+	})
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	req.Header.Set(header, "client-123")
+	rec := httptest.NewRecorder()
+	e.ServeHTTP(rec, req)
+	if got != generated || rec.Header().Get(header) != generated {
+		t.Fatalf("request ID/header = %q/%q, want %q", got, rec.Header().Get(header), generated)
+	}
+	if value := rec.Header().Get(defaultRequestIDHeader); value != "" {
+		t.Fatalf("unexpected default response header = %q", value)
 	}
 }
 
 func TestRequestContextRequestIDLifecycle(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name        string
-		incoming    string
-		generated   string
-		want        string
-		disableResp bool
+		name          string
+		incoming      string
+		generated     string
+		want          string
+		disableResp   bool
+		wantGenerated int
 	}{
-		{"valid incoming", "client-123", "generated-1", "client-123", false},
-		{"missing", "", "generated-2", "generated-2", false},
-		{"unsafe", "bad value", "generated-3", "generated-3", false},
-		{"disabled response header", "client-4", "generated-4", "client-4", true},
+		{name: "valid incoming", incoming: "client-123", generated: "generated-1", want: "client-123"},
+		{name: "missing", generated: "generated-2", want: "generated-2", wantGenerated: 1},
+		{name: "unsafe", incoming: "bad value", generated: "generated-3", want: "generated-3", wantGenerated: 1},
+		{
+			name: "disabled response header", incoming: "client-4", generated: "generated-4",
+			want: "client-4", disableResp: true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			generatedCalls := 0
 			e := echo.New()
 			e.Use(RequestContext(RequestContextConfig{
 				DisableResponseHeader: tt.disableResp,
-				NewRequestID:          func() string { return tt.generated },
+				NewRequestID: func() string {
+					generatedCalls++
+					return tt.generated
+				},
 			}))
 			var requestID, correlationID string
 			e.GET("/test", func(c *echo.Context) error {
@@ -72,6 +122,9 @@ func TestRequestContextRequestIDLifecycle(t *testing.T) {
 			}
 			if got := rec.Header().Get(defaultRequestIDHeader); got != wantHeader {
 				t.Fatalf("response header = %q, want %q", got, wantHeader)
+			}
+			if generatedCalls != tt.wantGenerated {
+				t.Fatalf("NewRequestID calls = %d, want %d", generatedCalls, tt.wantGenerated)
 			}
 		})
 	}
@@ -116,6 +169,7 @@ func TestRequestContextTracestateBoundary(t *testing.T) {
 	t.Parallel()
 	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	for _, size := range []int{maxTracestateLen, maxTracestateLen + 1} {
+		tracestate := strings.Repeat("a", size)
 		e := echo.New()
 		e.Use(RequestContext(RequestContextConfig{}))
 		var got string
@@ -125,14 +179,20 @@ func TestRequestContextTracestateBoundary(t *testing.T) {
 		})
 		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
 		req.Header.Set("Traceparent", traceparent)
-		req.Header.Set("Tracestate", strings.Repeat("a", size))
+		req.Header.Set("Tracestate", tracestate)
 		e.ServeHTTP(httptest.NewRecorder(), req)
-		want := size
+		want := tracestate
 		if size > maxTracestateLen {
-			want = 0
+			want = ""
 		}
-		if len(got) != want {
-			t.Fatalf("size %d produced tracestate length %d, want %d", size, len(got), want)
+		if got != want {
+			t.Fatalf(
+				"size %d: preserved input=%v, got length=%d, want length=%d",
+				size,
+				got == tracestate,
+				len(got),
+				len(want),
+			)
 		}
 	}
 }
@@ -164,7 +224,8 @@ func TestRequestContextPreservesExistingMetadataLogger(t *testing.T) {
 	var existingBuffer, configuredBuffer bytes.Buffer
 	existing := newTestLogger(t, LoggerConfig{Writer: &existingBuffer})
 	configured := newTestLogger(t, LoggerConfig{Writer: &configuredBuffer})
-	metadata := &requestMetadata{RequestID: "existing", CorrelationID: "existing", Logger: existing}
+	existingLogger := existing.With(zap.String("source", "existing"))
+	metadata := &requestMetadata{RequestID: "existing", CorrelationID: "existing", Logger: existingLogger}
 	e := echo.New()
 	e.Use(RequestContext(RequestContextConfig{Logger: configured}))
 	e.GET("/", func(c *echo.Context) error {
@@ -173,63 +234,108 @@ func TestRequestContextPreservesExistingMetadataLogger(t *testing.T) {
 	})
 	ctx := contextWithRequestMetadata(context.Background(), metadata)
 	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil))
-	if !strings.Contains(existingBuffer.String(), "preserved") || configuredBuffer.Len() != 0 {
-		t.Fatalf("existing=%q configured=%q", existingBuffer.String(), configuredBuffer.String())
+	entry := decodeSingleLogLine(t, existingBuffer.String())
+	if entry["message"] != "preserved" || entry["source"] != "existing" || configuredBuffer.Len() != 0 {
+		t.Fatalf("existing=%#v configured=%q", entry, configuredBuffer.String())
+	}
+	if metadata.RequestID != "existing" || metadata.CorrelationID != "existing" || metadata.Logger != existingLogger {
+		t.Fatalf("incoming metadata was mutated: %#v", metadata)
 	}
 }
 
-func TestNewValidRequestIDFallbacks(t *testing.T) {
+func TestNewValidRequestIDUsesSafeDefaultFormatWhenCustomGenerationFails(t *testing.T) {
 	t.Parallel()
-	calls := 0
-	id := newValidRequestID(func() string {
-		calls++
-		return "invalid value"
-	}, DefaultValidateRequestID)
-	if calls != 2 || !DefaultValidateRequestID(id) || len(id) != 32 {
-		t.Fatalf("calls=%d id=%q", calls, id)
+	for _, tt := range []struct {
+		name     string
+		validate func(string) bool
+	}{
+		{name: "default validator", validate: DefaultValidateRequestID},
+		{name: "validator rejects every candidate", validate: func(string) bool { return false }},
+	} {
+		calls := 0
+		id := newValidRequestID(func() string {
+			calls++
+			return "invalid value"
+		}, tt.validate)
+		decoded, err := hex.DecodeString(id)
+		if calls != 2 || err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
+			t.Errorf("%s: calls=%d id=%q decode_error=%v", tt.name, calls, id, err)
+		}
 	}
+}
 
-	constant := newValidRequestID(func() string { return "still invalid" }, func(string) bool { return false })
-	if constant != "00000000000000000000000000000000" {
-		t.Fatalf("constant fallback = %q", constant)
+func TestDefaultNewRequestIDProducesUniqueLowercase128BitValues(t *testing.T) {
+	t.Parallel()
+	const count = 64
+	seen := make(map[string]struct{}, count)
+	for range count {
+		id := defaultNewRequestID()
+		decoded, err := hex.DecodeString(id)
+		if err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
+			t.Fatalf("generated request ID %q is not 32 lowercase hexadecimal characters", id)
+		}
+		if _, duplicate := seen[id]; duplicate {
+			t.Fatalf("generated duplicate request ID %q", id)
+		}
+		seen[id] = struct{}{}
 	}
 }
 
 func TestContextAccessorsWithoutMetadata(t *testing.T) {
 	t.Parallel()
-	//lint:ignore SA1012 Nil is part of the accessor contract under test.
-	if RequestID(nil) != "" { //nolint:staticcheck // verifies nil-safety contract
-		t.Fatal("nil context returned a request ID")
-	}
-	//lint:ignore SA1012 Nil is part of the accessor contract under test.
-	if CorrelationID(nil) != "" { //nolint:staticcheck // verifies nil-safety contract
-		t.Fatal("nil context returned a correlation ID")
-	}
-	//lint:ignore SA1012 Nil is part of the accessor contract under test.
-	if Trace(nil).Valid { //nolint:staticcheck // verifies nil-safety contract
-		t.Fatal("nil context returned a valid trace")
+	for _, tt := range []struct {
+		name string
+		ctx  context.Context
+	}{
+		{name: "nil"},
+		{name: "background", ctx: context.Background()},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			requestID := RequestID(tt.ctx)
+			correlationID := CorrelationID(tt.ctx)
+			if requestID != "" || correlationID != "" {
+				t.Fatalf("request/correlation IDs = %q/%q, want empty", requestID, correlationID)
+			}
+			if trace := Trace(tt.ctx); trace != (TraceContext{}) {
+				t.Fatalf("trace = %#v, want zero value", trace)
+			}
+		})
 	}
 }
 
 func TestHTTPRequestContextLifecycle(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name       string
-		incoming   string
-		generated  string
-		want       string
-		disable    bool
-		customName string
+		name          string
+		incoming      string
+		generated     string
+		want          string
+		disable       bool
+		customName    string
+		responseName  string
+		validate      func(string) bool
+		wantGenerated int
 	}{
 		{name: "valid incoming", incoming: "client-123", generated: "generated-1", want: "client-123"},
-		{name: "missing", generated: "generated-2", want: "generated-2"},
-		{name: "invalid", incoming: "bad value", generated: "generated-3", want: "generated-3"},
+		{name: "missing", generated: "generated-2", want: "generated-2", wantGenerated: 1},
+		{name: "invalid", incoming: "bad value", generated: "generated-3", want: "generated-3", wantGenerated: 1},
 		{name: "disabled response", incoming: "client-4", want: "client-4", disable: true},
 		{name: "custom header", incoming: "custom-5", want: "custom-5", customName: "X-Correlation-Request"},
+		{
+			name: "custom response header", incoming: "client-6", want: "client-6",
+			customName: "X-Correlation-Request", responseName: "X-Correlation-Response",
+		},
+		{
+			name: "custom validator", incoming: "client-123", generated: "custom:id", want: "custom:id",
+			validate:      func(value string) bool { return strings.HasPrefix(value, "custom:") },
+			wantGenerated: 1,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
+			generatedCalls := 0
 			header := tt.customName
 			if header == "" {
 				header = defaultRequestIDHeader
@@ -242,9 +348,13 @@ func TestHTTPRequestContextLifecycle(t *testing.T) {
 			})
 			handler := HTTPRequestContext(HTTPRequestContextConfig{
 				RequestIDHeader:       header,
-				ResponseHeader:        header,
+				ResponseHeader:        tt.responseName,
 				DisableResponseHeader: tt.disable,
-				NewRequestID:          func() string { return tt.generated },
+				NewRequestID: func() string {
+					generatedCalls++
+					return tt.generated
+				},
+				ValidateRequestID: tt.validate,
 			})(next)
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/test", nil)
 			if tt.incoming != "" {
@@ -255,12 +365,19 @@ func TestHTTPRequestContextLifecycle(t *testing.T) {
 			if gotRequestID != tt.want || gotCorrelationID != tt.want {
 				t.Fatalf("IDs = %q/%q, want %q", gotRequestID, gotCorrelationID, tt.want)
 			}
+			responseHeader := tt.responseName
+			if responseHeader == "" {
+				responseHeader = header
+			}
 			wantHeader := tt.want
 			if tt.disable {
 				wantHeader = ""
 			}
-			if got := rec.Header().Get(header); got != wantHeader {
+			if got := rec.Header().Get(responseHeader); got != wantHeader {
 				t.Fatalf("response header = %q, want %q", got, wantHeader)
+			}
+			if generatedCalls != tt.wantGenerated {
+				t.Fatalf("NewRequestID calls = %d, want %d", generatedCalls, tt.wantGenerated)
 			}
 		})
 	}
@@ -270,18 +387,18 @@ func TestHTTPRequestContextTraceAndTracestate(t *testing.T) {
 	t.Parallel()
 	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	tests := []struct {
-		name          string
-		traceparent   string
-		tracestate    string
-		wantValid     bool
-		wantStateSize int
+		name           string
+		traceparent    string
+		tracestate     string
+		wantValid      bool
+		wantTracestate string
 	}{
 		{
-			name:          "valid",
-			traceparent:   traceparent,
-			tracestate:    "vendor=value",
-			wantValid:     true,
-			wantStateSize: len("vendor=value"),
+			name:           "valid",
+			traceparent:    traceparent,
+			tracestate:     "vendor=value",
+			wantValid:      true,
+			wantTracestate: "vendor=value",
 		},
 		{
 			name:        "overlong state",
@@ -305,8 +422,16 @@ func TestHTTPRequestContextTraceAndTracestate(t *testing.T) {
 			req.Header.Set("X-Traceparent", tt.traceparent)
 			req.Header.Set("X-Tracestate", tt.tracestate)
 			handler.ServeHTTP(httptest.NewRecorder(), req)
-			if got.Valid != tt.wantValid || len(got.Tracestate) != tt.wantStateSize {
-				t.Fatalf("trace = %#v, want valid=%v state size=%d", got, tt.wantValid, tt.wantStateSize)
+			if got.Valid != tt.wantValid || got.Tracestate != tt.wantTracestate {
+				t.Fatalf(
+					"trace = %#v, want valid=%v tracestate=%q",
+					got,
+					tt.wantValid,
+					tt.wantTracestate,
+				)
+			}
+			if tt.wantValid && got.Traceparent != traceparent {
+				t.Fatalf("traceparent = %q, want %q", got.Traceparent, traceparent)
 			}
 		})
 	}
@@ -360,9 +485,10 @@ func TestHTTPRequestContextMetadataReuseAndImmutability(t *testing.T) {
 	var existingBuffer, configuredBuffer bytes.Buffer
 	existing := newTestLogger(t, LoggerConfig{Writer: &existingBuffer})
 	configured := newTestLogger(t, LoggerConfig{Writer: &configuredBuffer})
+	existingLogger := existing.With(zap.String("source", "existing"))
 	metadata := &requestMetadata{
 		RequestID: "existing-req", CorrelationID: "existing-corr",
-		Logger: existing.With(zap.String("source", "existing")),
+		Logger: existingLogger,
 	}
 	ctx := contextWithRequestMetadata(context.Background(), metadata)
 	handler := HTTPRequestContext(
@@ -376,8 +502,14 @@ func TestHTTPRequestContextMetadataReuseAndImmutability(t *testing.T) {
 		}),
 	)
 	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil))
-	if metadata.Logger == nil || !strings.Contains(existingBuffer.String(), "reused") || configuredBuffer.Len() != 0 {
-		t.Fatalf("existing=%q configured=%q metadata=%#v", existingBuffer.String(), configuredBuffer.String(), metadata)
+	entry := decodeSingleLogLine(t, existingBuffer.String())
+	if entry["message"] != "reused" || entry["source"] != "existing" || configuredBuffer.Len() != 0 {
+		t.Fatalf("existing=%#v configured=%q", entry, configuredBuffer.String())
+	}
+	if metadata.RequestID != "existing-req" ||
+		metadata.CorrelationID != "existing-corr" ||
+		metadata.Logger != existingLogger {
+		t.Fatalf("incoming metadata was mutated: %#v", metadata)
 	}
 }
 
@@ -385,7 +517,8 @@ func TestHTTPRequestContextCompletesLoggerOnlyMetadata(t *testing.T) {
 	t.Parallel()
 	var buffer bytes.Buffer
 	existing := newTestLogger(t, LoggerConfig{Writer: &buffer})
-	original := &requestMetadata{Logger: existing.With(zap.String("source", "outer"))}
+	originalLogger := existing.With(zap.String("source", "outer"))
+	original := &requestMetadata{Logger: originalLogger}
 	ctx := contextWithRequestMetadata(context.Background(), original)
 	handler := HTTPRequestContext(HTTPRequestContextConfig{
 		NewRequestID: func() string { return "generated-http" },
@@ -396,8 +529,13 @@ func TestHTTPRequestContextCompletesLoggerOnlyMetadata(t *testing.T) {
 		Logger(r.Context()).Info("completed")
 	}))
 	handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil))
-	if original.RequestID != "" || original.CorrelationID != "" || !strings.Contains(buffer.String(), "completed") {
-		t.Fatalf("input mutated or logger missing: original=%#v logs=%q", original, buffer.String())
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{
+		"message": "completed", "source": "outer",
+		"request_id": "generated-http", "correlation_id": "generated-http",
+	})
+	if original.RequestID != "" || original.CorrelationID != "" || original.Logger != originalLogger {
+		t.Fatalf("incoming metadata was mutated: %#v", original)
 	}
 }
 
@@ -426,19 +564,23 @@ func TestRequestContextReusesHTTPMetadata(t *testing.T) {
 	}
 }
 
-func TestRequestContextLoggerInstallDoesNotMutateMetadata(t *testing.T) {
+func TestRequestContextInstallsLoggerWithoutMutatingExistingMetadata(t *testing.T) {
 	t.Parallel()
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 	metadata := &requestMetadata{RequestID: "existing", CorrelationID: "existing"}
 	ctx := contextWithRequestMetadata(context.Background(), metadata)
 	e := echo.New()
-	e.Use(RequestContext(RequestContextConfig{Logger: zap.NewNop()}))
+	e.Use(RequestContext(RequestContextConfig{Logger: logger}))
 	e.GET("/", func(c *echo.Context) error {
-		if Logger(c.Request().Context()) == nil {
-			t.Fatal("logger is nil")
-		}
+		Logger(c.Request().Context()).Info("installed")
 		return nil
 	})
 	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil))
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{
+		"message": "installed", "request_id": "existing", "correlation_id": "existing",
+	})
 	if metadata.Logger != nil {
 		t.Fatal("input metadata was mutated")
 	}
