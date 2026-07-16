@@ -5,6 +5,7 @@
 [![GitHub release](https://img.shields.io/github/v/release/janisto/echo-observability)](https://github.com/janisto/echo-observability/releases/latest)
 [![Go version](https://img.shields.io/github/go-mod/go-version/janisto/echo-observability)](go.mod)
 [![License](https://img.shields.io/github/license/janisto/echo-observability)](LICENSE)
+[![Socket Badge](https://badge.socket.dev/go/package/github.com/janisto/echo-observability)](https://socket.dev/go/package/github.com/janisto/echo-observability)
 
 `echo-observability` provides request correlation, request-scoped Zap loggers,
 and structured Zap access logging middleware for
