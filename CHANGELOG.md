@@ -7,12 +7,25 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-07-16
+
 ### Added
 
+- Add project health, Go reference, release, Go version, and license badges to
+  the README.
+- Add a maintainer release guide and repository-specific contributor guidance
+  for validation, security checks, pull requests, and releases.
 - Add a `just mutation` recipe backed by the Gremlins CLI, with
   contributor guidance for reviewing meaningful surviving mutants.
 - Add a `just fuzz` recipe and contributor guidance for running the existing
   `FuzzParseTraceparent` target with Go's native fuzzing engine.
+
+### Changed
+
+- Stabilize the exported API and documented structured log fields under the
+  semantic-versioning compatibility guarantees of the v1 release line.
+- Expand the README with the package rationale and its structured-logging and
+  request-correlation scope.
 
 ## [0.2.0] - 2026-07-15
 
@@ -52,6 +65,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Add runnable cloud examples, a tested local wrapper, public documentation,
   CI, linting, and dependency automation.
 
-[Unreleased]: https://github.com/janisto/echo-observability/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/janisto/echo-observability/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/janisto/echo-observability/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/janisto/echo-observability/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/janisto/echo-observability/releases/tag/v0.1.0

@@ -67,9 +67,9 @@ endpoint exporters.
 - Echo v5 only.
 - Zap.
 
-The package is currently intended for a `v0.x` release line. Public API names
-and log field names are maintained carefully, but this is not a v1
-compatibility promise yet.
+Starting with v1.0.0, exported APIs and documented structured log fields are
+compatibility contracts. Breaking changes are reserved for a future major
+version.
 
 ## Install
 
