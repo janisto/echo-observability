@@ -64,7 +64,7 @@ endpoint exporters.
 ## Requirements
 
 - Go 1.25 or newer; deploy with the latest available patch release.
-- Echo v5 only.
+- Echo v5.2.0 or newer within the Echo v5 line.
 - Zap.
 
 Starting with v1.0.0, exported APIs and documented structured log fields are

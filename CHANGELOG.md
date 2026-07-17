@@ -11,6 +11,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- Lower the minimum supported Echo v5 version from v5.2.1 to v5.2.0 and add
+  CI coverage against the latest Echo v5 release.
 - Expand the canonical GCP health example with correlated info, debug, and
   access records containing developer-defined service fields, plus an
   in-process JSON-output test for level filtering and field separation.
