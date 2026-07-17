@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-07-17
+
 ### Changed
 
 - Expand the canonical GCP health example with correlated info, debug, and
@@ -71,7 +73,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Add runnable cloud examples, a tested local wrapper, public documentation,
   CI, linting, and dependency automation.
 
-[Unreleased]: https://github.com/janisto/echo-observability/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/janisto/echo-observability/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/janisto/echo-observability/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/janisto/echo-observability/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/janisto/echo-observability/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/janisto/echo-observability/releases/tag/v0.1.0
