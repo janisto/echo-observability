@@ -1,10 +1,9 @@
 # echo-observability
 
-[![CI](https://img.shields.io/github/actions/workflow/status/janisto/echo-observability/ci.yml?branch=main&label=CI)](https://github.com/janisto/echo-observability/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/janisto/echo-observability)](https://github.com/janisto/echo-observability/releases/latest)
 [![Go Reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/janisto/echo-observability)
-[![GitHub release](https://img.shields.io/github/v/release/janisto/echo-observability)](https://github.com/janisto/echo-observability/releases/latest)
-[![Go version](https://img.shields.io/github/go-mod/go-version/janisto/echo-observability)](go.mod)
-[![License](https://img.shields.io/github/license/janisto/echo-observability)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/janisto/echo-observability)](https://github.com/janisto/echo-observability/blob/main/go.mod)
+[![CI](https://img.shields.io/github/actions/workflow/status/janisto/echo-observability/ci.yml?branch=main&label=CI)](https://github.com/janisto/echo-observability/actions/workflows/ci.yml)
 [![Socket Badge](https://badge.socket.dev/go/package/github.com/janisto/echo-observability)](https://socket.dev/go/package/github.com/janisto/echo-observability)
 
 `echo-observability` provides request correlation, request-scoped Zap loggers,
@@ -93,12 +92,16 @@ import (
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 
 	"github.com/janisto/echo-observability"
 )
 
 func main() {
-	logger, err := obs.NewLogger(obs.LoggerConfig{Preset: obs.PresetGCP})
+	logger, err := obs.NewLogger(obs.LoggerConfig{
+		Preset: obs.PresetGCP,
+		Level:  zapcore.DebugLevel,
+	})
 	if err != nil {
 		panic(err)
 	}
@@ -111,8 +114,17 @@ func main() {
 	)
 
 	e.GET("/health", func(c *echo.Context) error {
-		obs.Logger(c.Request().Context()).Info("health checked")
-		return c.NoContent(http.StatusNoContent)
+		logger := obs.Logger(c.Request().Context())
+		logger.Info("health check",
+			zap.String("service_name", "example-service"),
+			zap.String("health_status", "ok"),
+		)
+		logger.Debug("dependency check",
+			zap.String("dependency", "database"),
+			zap.String("dependency_status", "ok"),
+			zap.Int64("check_duration_ms", 3),
+		)
+		return c.JSON(http.StatusOK, map[string]bool{"ok": true})
 	})
 
 	if err := e.Start(":8080"); err != nil {
@@ -124,7 +136,9 @@ func main() {
 Install `RequestContext` before `AccessLogger`. Put recovery middleware after
 `AccessLogger` when panics must produce an access log before being recovered.
 Echo applies `Use` middleware after routing, so `c.Path()` contains the matched
-route template.
+route template. `NewLogger` defaults to info level; this example enables debug
+to show that both application levels retain the same request correlation fields
+as the terminal access record.
 
 ## Middleware
 
@@ -456,15 +470,25 @@ Zap directly rather than defining a second logger interface.
 
 ## Validation
 
-The repository validates the Go 1.25 support line using its latest patched
-toolchain with:
+Development uses [just](https://github.com/casey/just). On macOS, install the
+workflow linters:
 
 ```sh
-go test ./...
-go test -race ./...
-go vet ./...
-golangci-lint run ./...
+brew install actionlint zizmor
 ```
+
+Then run the repository gates:
+
+```sh
+just install
+just qa
+just vuln
+```
+
+`just qa` validates the Go 1.25 support line with formatting, lint, build,
+tests, race tests, [actionlint](https://github.com/rhysd/actionlint), and
+[zizmor](https://docs.zizmor.sh/). `just vuln` runs the Go vulnerability scanner
+separately.
 
 The suite covers the real Echo adapter path, standard `net/http` composition,
 request ID and trace boundaries, returned and committed response errors,

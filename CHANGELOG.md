@@ -7,6 +7,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Changed
+
+- Expand the canonical GCP health example with correlated info, debug, and
+  access records containing developer-defined service fields, plus an
+  in-process JSON-output test for level filtering and field separation.
+
 ## [1.0.0] - 2026-07-16
 
 ### Added
