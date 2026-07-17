@@ -23,11 +23,16 @@ Every service follows the same shape:
 2. Install `RequestContext` before `AccessLogger` with the same logger and preset.
 3. Install recovery after `AccessLogger` when panics must be logged first.
 4. Use `obs.Logger(ctx)` in handlers and services.
+5. Add service-specific fields directly to application logs; they do not leak
+   into the separate access record.
 
 The canonical GCP wiring is:
 
 ```go
-logger, err := obs.NewLogger(obs.LoggerConfig{Preset: obs.PresetGCP})
+logger, err := obs.NewLogger(obs.LoggerConfig{
+	Preset: obs.PresetGCP,
+	Level:  zapcore.DebugLevel,
+})
 if err != nil {
 	panic(err)
 }
@@ -66,13 +71,20 @@ curl -i \
 ```
 
 The request ID remains `demo-123`; `correlation_id` becomes the W3C trace ID.
-The handler and access records contain the same correlation fields. The access
-record also contains `httpRequest`, `/health` as the route template, and status
-200.
+The info-level health record, debug-level dependency record, and terminal
+access record contain the same correlation fields. Application records retain
+developer-defined service fields. The access record remains separate and
+contains `httpRequest`, `/health` as the route template, and status 200.
+
+The runnable GCP example opts into debug output. `NewLogger` defaults to info,
+which suppresses the dependency record and its fields while preserving the
+health and access records.
 
 Representative GCP fields:
 
 ```json
+{"severity":"INFO","message":"health check","request_id":"demo-123","correlation_id":"4bf92f3577b34da6a3ce929d0e0e4736","service_name":"example-service","health_status":"ok"}
+{"severity":"DEBUG","message":"dependency check","request_id":"demo-123","correlation_id":"4bf92f3577b34da6a3ce929d0e0e4736","dependency":"database","dependency_status":"ok","check_duration_ms":3}
 {"severity":"INFO","message":"request completed","request_id":"demo-123","correlation_id":"4bf92f3577b34da6a3ce929d0e0e4736","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","logging.googleapis.com/trace":"4bf92f3577b34da6a3ce929d0e0e4736","logging.googleapis.com/trace_sampled":true,"method":"GET","path":"/health","path_template":"/health","status":200}
 ```
 
