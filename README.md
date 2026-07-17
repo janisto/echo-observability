@@ -1,10 +1,9 @@
 # echo-observability
 
-[![CI](https://img.shields.io/github/actions/workflow/status/janisto/echo-observability/ci.yml?branch=main&label=CI)](https://github.com/janisto/echo-observability/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/janisto/echo-observability)](https://github.com/janisto/echo-observability/releases/latest)
 [![Go Reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/janisto/echo-observability)
-[![GitHub release](https://img.shields.io/github/v/release/janisto/echo-observability)](https://github.com/janisto/echo-observability/releases/latest)
-[![Go version](https://img.shields.io/github/go-mod/go-version/janisto/echo-observability)](go.mod)
-[![License](https://img.shields.io/github/license/janisto/echo-observability)](LICENSE)
+[![Go version](https://img.shields.io/github/go-mod/go-version/janisto/echo-observability)](https://github.com/janisto/echo-observability/blob/main/go.mod)
+[![CI](https://img.shields.io/github/actions/workflow/status/janisto/echo-observability/ci.yml?branch=main&label=CI)](https://github.com/janisto/echo-observability/actions/workflows/ci.yml)
 [![Socket Badge](https://badge.socket.dev/go/package/github.com/janisto/echo-observability)](https://socket.dev/go/package/github.com/janisto/echo-observability)
 
 `echo-observability` provides request correlation, request-scoped Zap loggers,
