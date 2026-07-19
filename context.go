@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"net/http"
-	"strings"
 	"sync/atomic"
 
 	"github.com/labstack/echo/v5"
@@ -36,6 +35,7 @@ type RequestContextConfig struct {
 	RequestIDHeader       string
 	TraceparentHeader     string
 	TracestateHeader      string
+	TraceContextLevel     TraceContextLevel
 	ResponseHeader        string
 	DisableResponseHeader bool
 	NewRequestID          func() string
@@ -101,6 +101,11 @@ func Trace(ctx context.Context) TraceContext {
 }
 
 func normalizeRequestContextConfig(config RequestContextConfig) RequestContextConfig {
+	level, err := ResolveTraceContextLevel(config.TraceContextLevel)
+	if err != nil {
+		panic(err)
+	}
+	config.TraceContextLevel = level
 	if config.RequestIDHeader == "" {
 		config.RequestIDHeader = defaultRequestIDHeader
 	}
@@ -123,15 +128,20 @@ func normalizeRequestContextConfig(config RequestContextConfig) RequestContextCo
 }
 
 func buildRequestMetadata(header http.Header, config RequestContextConfig) *requestMetadata {
-	requestID := header.Get(config.RequestIDHeader)
-	if !config.ValidateRequestID(requestID) {
+	requestID, singleRequestID := singleHeaderValue(header, config.RequestIDHeader)
+	if !singleRequestID || !validRequestID(requestID, config.ValidateRequestID) {
 		requestID = newValidRequestID(config.NewRequestID, config.ValidateRequestID)
 	}
 
-	trace, ok := ParseTraceparent(header.Get(config.TraceparentHeader))
-	if ok {
-		tracestate := strings.Join(header.Values(config.TracestateHeader), ",")
-		if len(tracestate) <= maxTracestateLen {
+	var trace TraceContext
+	if traceparent, singleTraceparent := singleHeaderValue(header, config.TraceparentHeader); singleTraceparent {
+		trace, _ = ParseTraceparentWithLevel(traceparent, config.TraceContextLevel)
+	}
+	if trace.Valid {
+		if tracestate, valid := parseTracestate(
+			header.Values(config.TracestateHeader),
+			config.TraceContextLevel,
+		); valid {
 			trace.Tracestate = tracestate
 		}
 	}
@@ -142,12 +152,24 @@ func buildRequestMetadata(header http.Header, config RequestContextConfig) *requ
 	return &requestMetadata{RequestID: requestID, CorrelationID: correlationID, Trace: trace}
 }
 
-func ensureRequestMetadata(c *echo.Context, preset Preset) *requestMetadata {
+func singleHeaderValue(header http.Header, name string) (string, bool) {
+	values := header.Values(name)
+	if len(values) != 1 {
+		return "", false
+	}
+	return values[0], true
+}
+
+func ensureRequestMetadata(
+	c *echo.Context,
+	preset Preset,
+	traceContextLevel TraceContextLevel,
+) *requestMetadata {
 	if metadata := metadataFromContext(c.Request().Context()); metadata != nil && metadata.RequestID != "" {
 		return metadata
 	}
 	existing := metadataFromContext(c.Request().Context())
-	config := normalizeRequestContextConfig(RequestContextConfig{})
+	config := normalizeRequestContextConfig(RequestContextConfig{TraceContextLevel: traceContextLevel})
 	metadata := buildRequestMetadata(c.Request().Header, config)
 	if existing != nil && existing.Logger != nil {
 		metadata.Logger = loggerWithMetadata(existing.Logger, metadata, preset)
@@ -207,14 +229,18 @@ func metadataFromContext(ctx context.Context) *requestMetadata {
 
 func newValidRequestID(newRequestID func() string, validate func(string) bool) string {
 	for range 2 {
-		if id := newRequestID(); validate(id) {
+		if id := newRequestID(); validRequestID(id, validate) {
 			return id
 		}
 	}
-	if id := fallbackRequestID(); validate(id) {
+	if id := fallbackRequestID(); validRequestID(id, validate) {
 		return id
 	}
 	return "00000000000000000000000000000000"
+}
+
+func validRequestID(value string, validate func(string) bool) bool {
+	return DefaultValidateRequestID(value) && validate(value)
 }
 
 func defaultNewRequestID() string {

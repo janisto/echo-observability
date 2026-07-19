@@ -7,6 +7,37 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Add GCP profile `0.1.0` selection with newest-supported default resolution,
+  exact pinning, and effective-version introspection.
+- Add independent `CapturePath`, `CapturePeerIP`, and `CaptureUserAgent`
+  access-log opt-ins.
+- Add immutable W3C Trace Context Level 1/Level 2 selection, effective-level
+  resolution, complete selected-level `tracestate` validation, and Level 2
+  `trace_id_random` projection.
+
+### Changed
+
+- **Breaking:** Omit raw path, direct peer IP, and user agent from access logs
+  by default. Applications that need them must enable the matching options.
+- **Breaking:** Rename the opt-in direct-peer field from `remote_ip` to
+  `peer_ip`; it now reads only `Request.RemoteAddr` and ignores Echo proxy IP
+  extraction. Narrow GCP `httpRequest.requestUrl` to the query-free path.
+- Align the GCP health fixture to service version `1.0.0`, operation
+  `health_check`, and deterministic 12.5 ms access timing.
+- **Breaking:** Reject duplicate raw request-ID and `traceparent` field-lines,
+  and prevent custom request-ID validators from admitting values outside the
+  package's safe baseline grammar.
+- **Breaking:** Remove status inference from errors handled later by Echo, add
+  `service_error` and `panic` terminal reasons, and make abnormal records
+  unconditionally `ERROR` while preserving returned errors and panics.
+- Contain panics from the access clock, status mapper, enrichment callback, and
+  writer without changing the response; keep the first repeated custom field
+  so package-controlled JSON contains no duplicate member names.
+- **Breaking:** Canonicalize Echo `:name` and terminal `*` route metadata to
+  portable `{name}` and `{*path}` templates; omit ambiguous native forms.
+
 ## [1.0.1] - 2026-07-17
 
 ### Changed

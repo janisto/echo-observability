@@ -2,6 +2,7 @@ package main
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/labstack/echo/v5"
 	"github.com/labstack/echo/v5/middleware"
@@ -12,35 +13,63 @@ import (
 )
 
 func main() {
+	profileVersion, err := obs.ResolveGCPProfileVersion(obs.PresetGCP, "")
+	if err != nil {
+		panic(err)
+	}
 	logger, err := obs.NewLogger(obs.LoggerConfig{
-		Preset: obs.PresetGCP,
-		Level:  zapcore.DebugLevel,
+		Preset:            obs.PresetGCP,
+		GCPProfileVersion: profileVersion,
+		Level:             zapcore.DebugLevel,
 	})
 	if err != nil {
 		panic(err)
 	}
 
-	e := newApp(logger)
+	e, err := newApp(logger, profileVersion, nil)
+	if err != nil {
+		panic(err)
+	}
 	if err := e.Start(":8080"); err != nil {
 		logger.Error("server stopped", zap.Error(err))
 	}
 }
 
-func newApp(logger *zap.Logger) *echo.Echo {
+func newApp(logger *zap.Logger, profileVersion obs.GCPProfileVersion, now func() time.Time) (*echo.Echo, error) {
+	return newAppWithPreset(logger, obs.PresetGCP, profileVersion, now)
+}
+
+func newAppWithPreset(
+	logger *zap.Logger,
+	preset obs.Preset,
+	profileVersion obs.GCPProfileVersion,
+	now func() time.Time,
+) (*echo.Echo, error) {
 	e := echo.New()
 	e.Use(
-		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: obs.PresetGCP}),
-		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger, Preset: obs.PresetGCP}),
+		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: preset}),
+		obs.AccessLogger(obs.AccessLoggerConfig{
+			Logger:            logger,
+			Preset:            preset,
+			GCPProfileVersion: profileVersion,
+			Now:               now,
+		}),
 		middleware.Recover(),
 	)
-	e.GET("/health", health)
-	return e
+	_, err := e.AddRoute(echo.Route{
+		Method:  http.MethodGet,
+		Path:    "/health",
+		Name:    "health_check",
+		Handler: health,
+	})
+	return e, err
 }
 
 func health(c *echo.Context) error {
 	logger := obs.Logger(c.Request().Context())
 	logger.Info("health check",
 		zap.String("service_name", "example-service"),
+		zap.String("service_version", "1.0.0"),
 		zap.String("health_status", "ok"),
 	)
 	logger.Debug("dependency check",

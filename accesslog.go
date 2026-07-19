@@ -2,6 +2,7 @@ package obs
 
 import (
 	"fmt"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -18,11 +19,16 @@ type StatusLeveler func(status int) zapcore.Level
 
 // AccessLoggerConfig configures AccessLogger middleware.
 type AccessLoggerConfig struct {
-	Logger      *zap.Logger
-	Preset      Preset
-	Now         func() time.Time
-	StatusLevel StatusLeveler
-	ExtraFields func(*echo.Context) []zap.Field
+	Logger            *zap.Logger
+	Preset            Preset
+	GCPProfileVersion GCPProfileVersion
+	TraceContextLevel TraceContextLevel
+	CapturePath       bool
+	CapturePeerIP     bool
+	CaptureUserAgent  bool
+	Now               func() time.Time
+	StatusLevel       StatusLeveler
+	ExtraFields       func(*echo.Context) []zap.Field
 }
 
 // AccessLogger returns Echo v5 middleware that installs a request-scoped Zap
@@ -31,8 +37,8 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 	cfg := normalizeAccessLoggerConfig(config)
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c *echo.Context) (err error) {
-			start := cfg.Now()
-			metadata := ensureRequestMetadata(c, cfg.Preset)
+			start, startOK := safeNow(cfg.Now)
+			metadata := ensureRequestMetadata(c, cfg.Preset, cfg.TraceContextLevel)
 			logger := metadata.Logger
 			if logger == nil {
 				logger = loggerWithMetadata(cfg.Logger, metadata, cfg.Preset)
@@ -42,40 +48,34 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 			defer func() {
 				panicValue := recover()
 				writeAccessLog := func() {
-					status := accessLogStatus(c.Response(), err, panicValue != nil)
+					status, hasStatus, terminalReason := accessLogOutcome(c.Response(), err, panicValue != nil)
 					if logger == nil {
 						logger = noopLogger
 					}
-					entry := logger.Check(cfg.StatusLevel(status), "request completed")
+					level := zapcore.InfoLevel
+					if terminalReason != "" {
+						level = zapcore.ErrorLevel
+					} else if hasStatus {
+						level = safeStatusLevel(cfg.StatusLevel, status)
+					}
+					entry := logger.Check(level, "request completed")
 					if entry == nil {
 						return
 					}
-					duration := max(cfg.Now().Sub(start), 0)
-					fields := accessLogFields(c, status, duration, cfg.Preset)
+					duration := safeDuration(cfg.Now, start, startOK)
+					fields := accessLogFields(c, status, hasStatus, terminalReason, duration, cfg)
 					if err != nil {
 						fields = append(fields, zap.Error(err))
 					}
 					if cfg.ExtraFields != nil {
-						fields = appendExtraFields(fields, cfg.ExtraFields(c))
+						fields = appendExtraFields(fields, safeExtraFields(cfg.ExtraFields, c))
 					}
 					entry.Write(fields...)
 				}
-				if panicValue == nil {
-					writeAccessLog()
-					return
+				containAccessLog(writeAccessLog)
+				if panicValue != nil {
+					panic(panicValue)
 				}
-
-				// Preserve the handler's original panic even if access-log
-				// enrichment or writing panics while the stack is unwinding.
-				func() {
-					defer func() {
-						if recover() != nil {
-							panic(panicValue)
-						}
-					}()
-					writeAccessLog()
-				}()
-				panic(panicValue)
 			}()
 
 			return next(c)
@@ -83,15 +83,33 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 	}
 }
 
-func accessLogStatus(response http.ResponseWriter, err error, panicked bool) int {
-	resp, status := echo.ResolveResponseStatus(response, err)
-	if panicked && (resp == nil || !resp.Committed) {
-		return http.StatusInternalServerError
+func accessLogOutcome(response http.ResponseWriter, err error, panicked bool) (int, bool, string) {
+	resp, status := echo.ResolveResponseStatus(response, nil)
+	hasStatus := resp != nil && resp.Committed
+	if !hasStatus {
+		status = 0
 	}
-	return status
+	switch {
+	case panicked:
+		return status, hasStatus, "panic"
+	case err != nil:
+		return status, hasStatus, "service_error"
+	default:
+		return status, hasStatus, ""
+	}
 }
 
 func normalizeAccessLoggerConfig(config AccessLoggerConfig) AccessLoggerConfig {
+	traceLevel, err := ResolveTraceContextLevel(config.TraceContextLevel)
+	if err != nil {
+		panic(err)
+	}
+	config.TraceContextLevel = traceLevel
+	version, err := ResolveGCPProfileVersion(config.Preset, config.GCPProfileVersion)
+	if err != nil {
+		panic(err)
+	}
+	config.GCPProfileVersion = version
 	if config.Logger == nil {
 		config.Logger = noopLogger
 	}
@@ -115,6 +133,55 @@ func DefaultStatusLevel(status int) zapcore.Level {
 	default:
 		return zapcore.InfoLevel
 	}
+}
+
+func safeNow(now func() time.Time) (value time.Time, ok bool) {
+	defer func() {
+		if recover() != nil {
+			value = time.Time{}
+			ok = false
+		}
+	}()
+	return now(), true
+}
+
+func safeDuration(now func() time.Time, start time.Time, startOK bool) time.Duration {
+	if !startOK {
+		return 0
+	}
+	finished, ok := safeNow(now)
+	if !ok {
+		return 0
+	}
+	return max(finished.Sub(start), 0)
+}
+
+func safeStatusLevel(mapper StatusLeveler, status int) (level zapcore.Level) {
+	defer func() {
+		if recover() != nil {
+			level = DefaultStatusLevel(status)
+		}
+	}()
+	return mapper(status)
+}
+
+func safeExtraFields(callback func(*echo.Context) []zap.Field, c *echo.Context) (fields []zap.Field) {
+	defer func() {
+		if recover() != nil {
+			fields = nil
+		}
+	}()
+	return callback(c)
+}
+
+func containAccessLog(write func()) (completed bool) {
+	defer func() {
+		if recover() != nil {
+			completed = false
+		}
+	}()
+	write()
+	return true
 }
 
 func loggerWithMetadata(
@@ -144,7 +211,7 @@ func requestMetadataFields(metadata *requestMetadata) []zap.Field {
 	if metadata == nil {
 		return nil
 	}
-	fields := make([]zap.Field, 0, 6)
+	fields := make([]zap.Field, 0, 7)
 	if metadata.RequestID != "" {
 		fields = append(fields, zap.String("request_id", metadata.RequestID))
 	}
@@ -158,41 +225,65 @@ func requestMetadataFields(metadata *requestMetadata) []zap.Field {
 			zap.String("trace_flags", metadata.Trace.Flags),
 			zap.Bool("trace_sampled", metadata.Trace.Sampled),
 		)
+		if metadata.Trace.Level == TraceContextLevel2 {
+			fields = append(fields, zap.Bool("trace_id_random", metadata.Trace.Random))
+		}
 	}
 	return fields
 }
 
-func accessLogFields(c *echo.Context, status int, duration time.Duration, preset Preset) []zap.Field {
+func accessLogFields(
+	c *echo.Context,
+	status int,
+	hasStatus bool,
+	terminalReason string,
+	duration time.Duration,
+	config AccessLoggerConfig,
+) []zap.Field {
 	req := c.Request()
-	path := requestPath(req)
-	remote := c.RealIP()
-	userAgent := req.UserAgent()
 	fields := []zap.Field{
 		zap.String("method", req.Method),
-		zap.String("path", path),
-		zap.Int("status", status),
 		zap.Float64("duration_ms", float64(duration)/float64(time.Millisecond)),
 	}
-	if pathTemplate := c.Path(); pathTemplate != "" {
+	if hasStatus {
+		fields = append(fields, zap.Int("status", status))
+	}
+	if terminalReason != "" {
+		fields = append(fields, zap.String("terminal_reason", terminalReason))
+	}
+	path := ""
+	if config.CapturePath {
+		path = requestPath(req)
+		fields = append(fields, zap.String("path", path))
+	}
+	if pathTemplate, ok := canonicalRouteTemplate(c.Path()); ok {
 		fields = append(fields, zap.String("path_template", pathTemplate))
 	}
 	route := c.RouteInfo()
 	if routeName := route.Name; isExplicitRouteName(routeName, route.Method, route.Path) {
 		fields = append(fields, zap.String("operation_id", routeName))
 	}
-	if remote != "" {
-		fields = append(fields, zap.String("remote_ip", remote))
+	peerIP := ""
+	if config.CapturePeerIP {
+		peerIP = directPeerIP(req.RemoteAddr)
+	}
+	if peerIP != "" {
+		fields = append(fields, zap.String("peer_ip", peerIP))
+	}
+	userAgent := ""
+	if config.CaptureUserAgent {
+		userAgent = req.UserAgent()
 	}
 	if userAgent != "" {
 		fields = append(fields, zap.String("user_agent", userAgent))
 	}
-	if preset == PresetGCP {
+	if config.Preset == PresetGCP {
 		fields = append(fields, zap.Object("httpRequest", gcpHTTPRequest{
 			Method:    req.Method,
-			URL:       requestURL(c),
+			URL:       path,
 			Status:    status,
 			UserAgent: userAgent,
-			RemoteIP:  remote,
+			RemoteIP:  peerIP,
 			Latency:   duration,
 		}))
 	}
@@ -206,11 +297,64 @@ func isExplicitRouteName(name, method, path string) bool {
 		name != method+":"+path
 }
 
-func appendExtraFields(fields, extra []zap.Field) []zap.Field {
-	for _, field := range extra {
-		if !isReservedLogField(field.Key) {
-			fields = append(fields, field)
+func canonicalRouteTemplate(native string) (string, bool) {
+	if native == "*" {
+		return "/{*path}", true
+	}
+	if !strings.HasPrefix(native, "/") || strings.ContainsAny(native, "?#") {
+		return "", false
+	}
+	segments := strings.Split(strings.TrimPrefix(native, "/"), "/")
+	canonical := make([]string, 0, len(segments))
+	for index, segment := range segments {
+		switch {
+		case segment == "*":
+			if index != len(segments)-1 {
+				return "", false
+			}
+			canonical = append(canonical, "{*path}")
+		case strings.HasPrefix(segment, ":"):
+			name := strings.TrimPrefix(segment, ":")
+			if !isRouteParameterName(name) {
+				return "", false
+			}
+			canonical = append(canonical, "{"+name+"}")
+		case strings.ContainsAny(segment, ":*{}"):
+			return "", false
+		default:
+			canonical = append(canonical, segment)
 		}
+	}
+	return "/" + strings.Join(canonical, "/"), true
+}
+
+func isRouteParameterName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	for index, char := range []byte(name) {
+		letter := char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z'
+		if !letter && char != '_' && (index == 0 || char < '0' || char > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+func appendExtraFields(fields, extra []zap.Field) []zap.Field {
+	seen := make(map[string]struct{})
+	for _, field := range fields {
+		seen[field.Key] = struct{}{}
+	}
+	for _, field := range extra {
+		if isReservedLogField(field.Key) {
+			continue
+		}
+		if _, exists := seen[field.Key]; exists {
+			continue
+		}
+		seen[field.Key] = struct{}{}
+		fields = append(fields, field)
 	}
 	return fields
 }
@@ -219,8 +363,9 @@ func isReservedLogField(key string) bool {
 	switch key {
 	case "timestamp", "level", "severity", "logger", "message", "error",
 		"request_id", "correlation_id", "trace_id", "parent_id", "trace_flags", "trace_sampled",
+		"trace_id_random",
 		"xray_trace_id", "operation_Id", "operation_ParentId", "method", "path", "path_template",
-		"operation_id", "status", "duration_ms", "remote_ip", "user_agent", "httpRequest",
+		"operation_id", "status", "duration_ms", "terminal_reason", "peer_ip", "remote_ip", "user_agent", "httpRequest",
 		"logging.googleapis.com/trace", "logging.googleapis.com/trace_sampled", "logging.googleapis.com/spanId":
 		return true
 	default:
@@ -238,19 +383,17 @@ func requestPath(req *http.Request) string {
 	return "/"
 }
 
-func requestURL(c *echo.Context) string {
-	req := c.Request()
-	if req.URL.Scheme != "" && req.URL.Host != "" {
-		return req.URL.String()
+func directPeerIP(remoteAddr string) string {
+	if remoteAddr == "" {
+		return ""
 	}
-	uri := req.URL.RequestURI()
-	if uri == "" {
-		uri = requestPath(req)
+	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		return strings.Trim(host, "[]")
 	}
-	if req.Host == "" {
-		return uri
+	if strings.HasPrefix(remoteAddr, "[") && strings.Contains(remoteAddr, "]") {
+		return strings.TrimPrefix(strings.SplitN(remoteAddr, "]", 2)[0], "[")
 	}
-	return c.Scheme() + "://" + req.Host + uri
+	return remoteAddr
 }
 
 func gcpTraceFields(trace TraceContext) []zap.Field {

@@ -51,8 +51,8 @@ Use this package when an Echo v5 service needs:
 - Strict W3C `traceparent` parsing and trace-level log correlation.
 - One structured access log after each Echo request.
 - Low-cardinality `path_template` values from Echo's `c.Path()`.
-- Echo v5 status resolution for committed responses and errors implementing
-  `echo.HTTPStatusCoder`.
+- Status authority only for responses committed before this middleware
+  boundary returns; centralized error-handler statuses are not guessed.
 - Generic, Google Cloud, AWS, and Azure JSON field presets.
 - Panic access logging followed by re-panic for the application's recovery middleware.
 - Router-wide request metadata for health checks, readiness probes, redirects,
@@ -98,9 +98,14 @@ import (
 )
 
 func main() {
+	profileVersion, err := obs.ResolveGCPProfileVersion(obs.PresetGCP, "")
+	if err != nil {
+		panic(err)
+	}
 	logger, err := obs.NewLogger(obs.LoggerConfig{
-		Preset: obs.PresetGCP,
-		Level:  zapcore.DebugLevel,
+		Preset:            obs.PresetGCP,
+		GCPProfileVersion: profileVersion,
+		Level:             zapcore.DebugLevel,
 	})
 	if err != nil {
 		panic(err)
@@ -109,23 +114,36 @@ func main() {
 	e := echo.New()
 	e.Use(
 		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: obs.PresetGCP}),
-		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger, Preset: obs.PresetGCP}),
+		obs.AccessLogger(obs.AccessLoggerConfig{
+			Logger:            logger,
+			Preset:            obs.PresetGCP,
+			GCPProfileVersion: profileVersion,
+		}),
 		middleware.Recover(),
 	)
 
-	e.GET("/health", func(c *echo.Context) error {
-		logger := obs.Logger(c.Request().Context())
-		logger.Info("health check",
-			zap.String("service_name", "example-service"),
-			zap.String("health_status", "ok"),
-		)
-		logger.Debug("dependency check",
-			zap.String("dependency", "database"),
-			zap.String("dependency_status", "ok"),
-			zap.Int64("check_duration_ms", 3),
-		)
-		return c.JSON(http.StatusOK, map[string]bool{"ok": true})
+	_, err = e.AddRoute(echo.Route{
+		Method:  http.MethodGet,
+		Path:    "/health",
+		Name:    "health_check",
+		Handler: func(c *echo.Context) error {
+			logger := obs.Logger(c.Request().Context())
+			logger.Info("health check",
+				zap.String("service_name", "example-service"),
+				zap.String("service_version", "1.0.0"),
+				zap.String("health_status", "ok"),
+			)
+			logger.Debug("dependency check",
+				zap.String("dependency", "database"),
+				zap.String("dependency_status", "ok"),
+				zap.Int64("check_duration_ms", 3),
+			)
+			return c.JSON(http.StatusOK, map[string]bool{"ok": true})
+		},
 	})
+	if err != nil {
+		panic(err)
+	}
 
 	if err := e.Start(":8080"); err != nil {
 		logger.Error("server stopped", zap.Error(err))
@@ -150,8 +168,9 @@ needed, parses W3C trace context, installs metadata on
 
 ```go
 e.Use(obs.RequestContext(obs.RequestContextConfig{
-	Logger: logger,
-	Preset: obs.PresetGCP,
+	Logger:            logger,
+	Preset:            obs.PresetGCP,
+	TraceContextLevel: obs.TraceContextLevel1,
 }))
 ```
 
@@ -163,12 +182,14 @@ Defaults:
 | Response header | Request ID header |
 | Trace header | `traceparent` |
 | Trace state header | `tracestate` |
+| Trace Context level | W3C Level 1 |
 | Request ID format | 32 lowercase hexadecimal characters |
 
 Incoming request IDs are at most 128 bytes and may contain ASCII letters,
-digits, `-`, `.`, `_`, and `~`. Customize generation or validation with
-`NewRequestID` and `ValidateRequestID`. Set `DisableResponseHeader` when the
-request ID must not be returned.
+digits, `-`, `.`, `_`, and `~`. A custom `ValidateRequestID` may further
+restrict that baseline but cannot admit an unsafe value. Multiple raw request
+ID field-lines are ambiguous and cause a replacement ID to be generated.
+Set `DisableResponseHeader` when the request ID must not be returned.
 
 Access metadata anywhere a standard `context.Context` is available:
 
@@ -235,46 +256,55 @@ is intentionally a no-op outside installed request metadata.
 missing, but explicit installation of both middlewares is preferred. It emits:
 
 - `method`
-- `path` — escaped request path; never includes the query string
-- `path_template` — Echo route pattern such as `/users/:id`
+- `path` — escaped request path when `CapturePath` is enabled; never includes
+  the query string
+- `path_template` — canonical Echo route pattern such as `/users/{id}` or `/files/{*path}`
 - `operation_id` — explicit Echo route name, when configured
-- `status`
+- `status` — only when the response was already committed at this boundary
 - `duration_ms`
-- `remote_ip`
-- `user_agent`
+- `terminal_reason` — `service_error` for returned errors or `panic`
+- `peer_ip` — direct `Request.RemoteAddr` peer when `CapturePeerIP` is enabled
+- `user_agent` when `CaptureUserAgent` is enabled
 - `error` — returned Echo error, when present
 
 The request-scoped fields are `request_id`, `correlation_id`, and, for valid
-W3C trace context, `trace_id`, `parent_id`, `trace_flags`, and `trace_sampled`.
+W3C trace context, `trace_id`, `parent_id`, `trace_flags`, and
+`trace_sampled`. Explicit Level 2 also adds `trace_id_random`.
 
-Echo's `ResolveResponseStatus` determines the logged status. A committed
-response wins over a later error; otherwise an Echo `HTTPStatusCoder` status
-wins, and a plain error maps to 500. The original error is returned unchanged
-for Echo's centralized HTTP error handler.
-
-Application errors that a custom `HTTPErrorHandler` maps to a non-500 status
-must implement `echo.HTTPStatusCoder` so the access log and eventual response
-use the same status. `AccessLogger` intentionally does not invoke the global
-error handler itself because that would commit the response inside the logging
-middleware.
+Only a response committed before the handler returns supplies logged status.
+A returned error uses terminal reason `service_error`, level `ERROR`, and no
+status when Echo's centralized error handler has not run yet. The original
+error is returned unchanged for that handler. `AccessLogger` intentionally
+does not invoke the global error handler itself because that would commit the
+response inside logging middleware. Consequently, the later wire status may be
+absent from this package's record rather than guessed from
+`echo.HTTPStatusCoder`.
 
 Use `ExtraFields` for application-owned access-log fields. Package-owned and
 provider-owned field names are ignored to prevent duplicate JSON keys.
+If the returned Zap field slice repeats a custom key, the first value wins.
 `ExtraFields` is evaluated only when the selected access-log level is enabled,
 so suppressed logs do not run application enrichment callbacks.
 
+`CapturePath`, `CapturePeerIP`, and `CaptureUserAgent` are independent and
+default to false. A provider preset never enables them. `peer_ip` ignores
+forwarded headers and Echo's `IPExtractor`; proxy-derived client identity is a
+different, application-owned concept.
+
 ```go
 e.Use(obs.AccessLogger(obs.AccessLoggerConfig{
-	Logger: logger,
-	Preset: obs.PresetGCP,
+	Logger:            logger,
+	Preset:            obs.PresetGCP,
+	GCPProfileVersion: profileVersion,
 	ExtraFields: func(c *echo.Context) []zap.Field {
 		return []zap.Field{zap.String("tenant_id", tenantID(c))}
 	},
 }))
 ```
 
-`StatusLevel` can override the default mapping: 5xx is error, 4xx is warn, and
-all other statuses are info. `Now` exists for deterministic testing.
+`StatusLevel` can override the normal-response mapping: 5xx is error, 4xx is
+warn, and all other statuses are info. Abnormal terminal reasons always use
+error. `Now` exists for deterministic testing.
 
 ## Named Routes
 
@@ -290,16 +320,40 @@ _, err := e.AddRoute(echo.Route{
 })
 ```
 
-The raw request `/users/123` logs `path=/users/123` and
-`path_template=/users/:id`. Group metrics or logs by `path_template`, not
+With `CapturePath` enabled, the raw request `/users/123` logs `path=/users/123` and
+`path_template=/users/{id}`. Echo whole-segment `:name` parameters become
+`{name}`, and its unnamed terminal `*` becomes `{*path}`. Ambiguous optional or
+composite forms are omitted. Group metrics or logs by `path_template`, not
 `path`, to avoid high-cardinality dimensions.
 
 ## Trace Correlation
 
 W3C `traceparent` is the only trace input. A valid trace ID becomes
 `correlation_id`; otherwise `correlation_id` falls back to `request_id`.
-Multiple `tracestate` header fields are combined in wire order, and the
-combined value is retained only when it is at most 512 bytes.
+Level 1 is the default. Select the pinned Level 2 mode explicitly and use the
+same immutable level for request context and access logging:
+
+```go
+const traceLevel = obs.TraceContextLevel2
+e.Use(
+	obs.RequestContext(obs.RequestContextConfig{
+		Logger: logger, Preset: obs.PresetGCP, TraceContextLevel: traceLevel,
+	}),
+	obs.AccessLogger(obs.AccessLoggerConfig{
+		Logger: logger, Preset: obs.PresetGCP, TraceContextLevel: traceLevel,
+	}),
+)
+```
+
+`ResolveTraceContextLevel(0)` exposes the effective default. Unsupported
+levels fail during middleware construction. Exactly one raw `traceparent`
+field-line is eligible. Multiple `tracestate` fields are combined in wire
+order and validated with the selected level's complete key/value grammar,
+unique keys, at most 32 members, and a 512-byte raw ceiling. Invalid
+`tracestate` is discarded without discarding a valid `traceparent`.
+Level 2 projects bit one of `trace_flags` as `trace_id_random`; Level 1
+preserves the two-character flags but does not assign that bit portable
+meaning.
 
 Provider-specific headers such as `X-Cloud-Trace-Context`,
 `X-Amzn-Trace-Id`, and Azure's legacy `Request-Id` are intentionally not
@@ -311,13 +365,23 @@ segments.
 Use the same preset for `NewLogger`, `RequestContext`, and `AccessLogger`.
 
 ```go
-logger, err := obs.NewLogger(obs.LoggerConfig{Preset: obs.PresetGCP})
+profileVersion, err := obs.ResolveGCPProfileVersion(obs.PresetGCP, "")
+if err != nil {
+	return err
+}
+logger, err := obs.NewLogger(obs.LoggerConfig{
+	Preset:            obs.PresetGCP,
+	GCPProfileVersion: profileVersion,
+})
+if err != nil {
+	return err
+}
 e.Use(
 	obs.RequestContext(obs.RequestContextConfig{
 		Logger: logger, Preset: obs.PresetGCP,
 	}),
 	obs.AccessLogger(obs.AccessLoggerConfig{
-		Logger: logger, Preset: obs.PresetGCP,
+		Logger: logger, Preset: obs.PresetGCP, GCPProfileVersion: profileVersion,
 	}),
 )
 ```
@@ -329,6 +393,17 @@ The GCP preset emits `severity` instead of `level`, a structured
 `logging.googleapis.com/trace_sampled`. The trace field contains the raw W3C
 trace ID, which is Google Cloud's preferred format. It deliberately does not
 emit `logging.googleapis.com/spanId` from the incoming parent ID.
+
+The installed package supports GCP profile `0.1.0`. Omitting the version
+selects that newest supported version during construction; exact pinning uses
+`GCPProfileVersionV0_1_0`. `ResolveGCPProfileVersion` exposes the effective
+value without a provider, registry, or network lookup. Invalid selections make
+`NewLogger` return an error and make `AccessLogger` panic immediately during
+middleware construction because its established API has no error return.
+
+GCP `httpRequest.requestUrl` is the exact captured path only, never scheme,
+authority, query, or fragment. `remoteIp` and `userAgent` appear only when the
+corresponding portable privacy option is enabled.
 
 ### AWS
 
@@ -359,19 +434,20 @@ Request-scoped lines add:
 - `request_id`.
 - `correlation_id`.
 - `trace_id`, `parent_id`, `trace_flags`, and `trace_sampled` only for a valid
-  W3C trace.
+  W3C trace; `trace_id_random` additionally in explicit Level 2 mode.
 - Provider-specific trace fields selected by the configured preset.
 
 Access lines add:
 
 - `method`.
-- `path`: escaped concrete URL path without the query string.
+- `path`: escaped concrete URL path without the query string, when opted in.
 - `path_template`: parameterized Echo route path when matched.
 - `operation_id`: explicitly configured Echo route name.
-- `status`.
+- `status`, only when committed before the middleware boundary returns.
 - `duration_ms`.
-- `remote_ip`: `c.RealIP()`, honoring the application's Echo `IPExtractor`.
-- `user_agent` when present.
+- `terminal_reason` for returned errors and panics.
+- `peer_ip`: direct transport peer from `Request.RemoteAddr`, when opted in.
+- `user_agent` when opted in and present.
 - `error` when Echo middleware or the handler returns an error.
 - `httpRequest` for the GCP preset only.
 
@@ -404,6 +480,7 @@ e.Use(
 	obs.AccessLogger(obs.AccessLoggerConfig{
 		Logger: logger,
 		Preset: obs.PresetGCP,
+		GCPProfileVersion: profileVersion,
 	}),
 	middleware.CORS(),
 	middleware.BodyLimit(1<<20),
@@ -415,9 +492,10 @@ Read request metadata with `obs.RequestID(c.Request().Context())` and log with
 `obs.Logger(c.Request().Context())`. Echo's own `e.Logger` remains separate
 from application request logging.
 
-Configure `e.IPExtractor` for the real deployment topology before serving
-requests. `AccessLogger` uses Echo's resolved client IP and therefore inherits
-its trust model for proxy headers.
+Configure `e.IPExtractor` for application features that need proxy-derived
+client identity. `AccessLogger` deliberately does not use it for portable
+`peer_ip`; that field is direct transport metadata and ignores forwarded
+headers.
 
 Keep the observability pair outside middleware such as `BodyLimit`, CORS, and
 authentication when their rejected requests must also receive request IDs and
@@ -443,15 +521,19 @@ secrets and personal data.
 
 ## Panic Behavior
 
-`AccessLogger` recovers a panic only long enough to emit an access log, then
-re-panics with the original value. An uncommitted response is logged as 500. If
-the response was already committed, its wire status is preserved in the log.
+`AccessLogger` recovers a panic only long enough to emit an `ERROR` access log
+with terminal reason `panic`, then re-panics with the original value. An
+uncommitted response has no logged status. If the response was already
+committed, its wire status is preserved in the log.
 If access-log enrichment or writing also panics while the handler panic is
 unwinding, the original handler panic remains the value propagated downstream.
+On a normal handler path, a panicking clock, status mapper, enrichment callback,
+or access writer is contained: safe defaults are used when possible and the
+HTTP response is unchanged. Failed writer calls are not retried.
 Install the application's recovery
 middleware inside it—later in the `e.Use` list—when the application must turn
-panics into HTTP responses. The package never swallows a panic or owns the
-response format.
+panics into HTTP responses. The package never swallows a downstream handler
+panic or owns the response format.
 
 ## Optional Local Wrapper
 
@@ -502,6 +584,7 @@ and request-context immutability. `ParseTraceparent` also has a fuzz target.
 - [Echo error handling](https://echo.labstack.com/guide/error-handling/)
 - [Go 1.25 release notes](https://go.dev/doc/go1.25)
 - [W3C Trace Context](https://www.w3.org/TR/trace-context/)
+- [W3C Trace Context Level 2](https://www.w3.org/TR/2024/CRD-trace-context-2-20240328/)
 - [Zap](https://github.com/uber-go/zap)
 - [Google Cloud structured logging](https://cloud.google.com/logging/docs/structured-logging)
 - [Google Cloud trace and log integration](https://docs.cloud.google.com/trace/docs/trace-log-integration)

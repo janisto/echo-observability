@@ -44,7 +44,10 @@ func TestAccessLoggerEmitsRouteTemplateAndRequestMetadata(t *testing.T) {
 	e.Use(
 		RequestContext(RequestContextConfig{Logger: logger}),
 		AccessLogger(AccessLoggerConfig{
-			Logger: logger,
+			Logger:           logger,
+			CapturePath:      true,
+			CapturePeerIP:    true,
+			CaptureUserAgent: true,
 			Now: fixedClock(
 				time.Date(2026, 7, 12, 12, 0, 0, 0, time.UTC),
 				time.Date(2026, 7, 12, 12, 0, 0, int(250*time.Millisecond), time.UTC),
@@ -78,26 +81,186 @@ func TestAccessLoggerEmitsRouteTemplateAndRequestMetadata(t *testing.T) {
 	entry := decodeSingleLogLine(t, buffer.String())
 	assertFields(t, entry, map[string]any{
 		"level": "INFO", "request_id": "req-route", "method": "GET",
-		"path": "/users/123", "path_template": "/users/:id", "operation_id": "get-user",
+		"path": "/users/123", "path_template": "/users/{id}", "operation_id": "get-user",
 		"status": float64(http.StatusCreated), "duration_ms": float64(250),
-		"remote_ip": "203.0.113.9", "user_agent": "test-agent", "tenant_id": "tenant-1",
+		"peer_ip": "203.0.113.9", "user_agent": "test-agent", "tenant_id": "tenant-1",
 	})
 }
 
-func TestAccessLoggerUsesEchoIPExtractor(t *testing.T) {
+func TestRequestIDScenariosReplaceAmbiguousValuesBeforeTerminalOutput(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		rawValues []string
+		generated string
+		duration  time.Duration
+		forbidden []string
+	}{
+		{
+			name: "duplicate", rawValues: []string{"caller-one", "caller-two"},
+			generated: "duplicate-replaced", duration: 2 * time.Millisecond,
+			forbidden: []string{"caller-one", "caller-two"},
+		},
+		{
+			name: "invalid", rawValues: []string{"bad value"},
+			generated: "generated-safe", duration: time.Millisecond,
+			forbidden: []string{"bad value"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var output bytes.Buffer
+			logger := newTestLogger(t, LoggerConfig{Writer: &output})
+			e := echo.New()
+			e.Use(
+				RequestContext(RequestContextConfig{
+					Logger:       logger,
+					NewRequestID: func() string { return tt.generated },
+				}),
+				AccessLogger(AccessLoggerConfig{
+					Logger: logger,
+					Now: fixedClock(
+						time.Unix(1, 0),
+						time.Unix(1, int64(tt.duration)),
+					),
+				}),
+			)
+			e.GET("/request-id", func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) })
+			request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/request-id", nil)
+			for _, value := range tt.rawValues {
+				request.Header.Add(defaultRequestIDHeader, value)
+			}
+			response := httptest.NewRecorder()
+
+			e.ServeHTTP(response, request)
+
+			if got := response.Header().Get(defaultRequestIDHeader); got != tt.generated {
+				t.Fatalf("response request ID = %q, want %q", got, tt.generated)
+			}
+			record := decodeSingleLogLine(t, output.String())
+			assertFields(t, record, map[string]any{
+				"message": "request completed", "request_id": tt.generated,
+				"correlation_id": tt.generated, "method": http.MethodGet,
+				"duration_ms": float64(tt.duration.Microseconds()) / 1000,
+				"status":      float64(http.StatusNoContent), "path_template": "/request-id",
+			})
+			for _, forbidden := range tt.forbidden {
+				if strings.Contains(output.String(), forbidden) {
+					t.Fatalf("terminal output contains rejected request ID %q: %s", forbidden, output.String())
+				}
+			}
+		})
+	}
+}
+
+func TestAccessLoggerPeerIPUsesDirectSocketAndIgnoresEchoIPExtractor(t *testing.T) {
 	t.Parallel()
 	var buffer bytes.Buffer
 	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 	e := echo.New()
 	e.IPExtractor = func(*http.Request) string { return "198.51.100.42" }
-	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger, CapturePeerIP: true}))
 	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
 	req.RemoteAddr = "203.0.113.9:4321"
 	e.ServeHTTP(httptest.NewRecorder(), req)
 	entry := decodeSingleLogLine(t, buffer.String())
-	if entry["remote_ip"] != "198.51.100.42" {
-		t.Fatalf("remote_ip = %v, want configured Echo IP", entry["remote_ip"])
+	if entry["peer_ip"] != "203.0.113.9" {
+		t.Fatalf("peer_ip = %v, want direct socket peer", entry["peer_ip"])
+	}
+	if _, ok := entry["remote_ip"]; ok {
+		t.Fatalf("legacy remote_ip unexpectedly emitted: %#v", entry)
+	}
+}
+
+func TestAccessLoggerPrivacyFieldsAreDisabledByDefault(t *testing.T) {
+	t.Parallel()
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Preset: PresetGCP, Writer: &buffer})
+	e := echo.New()
+	e.IPExtractor = func(*http.Request) string { return "198.51.100.42" }
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger, Preset: PresetGCP}))
+	e.GET("/private", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/private?secret=yes", nil)
+	req.RemoteAddr = "203.0.113.9:4321"
+	req.Header.Set("User-Agent", "privacy-canary")
+	e.ServeHTTP(httptest.NewRecorder(), req)
+
+	entry := decodeSingleLogLine(t, buffer.String())
+	for _, key := range []string{"path", "peer_ip", "remote_ip", "user_agent"} {
+		if _, ok := entry[key]; ok {
+			t.Fatalf("privacy field %q enabled by default: %#v", key, entry)
+		}
+	}
+	httpRequest, ok := entry["httpRequest"].(map[string]any)
+	if !ok {
+		t.Fatalf("httpRequest missing or wrong type: %#v", entry["httpRequest"])
+	}
+	assertFields(t, httpRequest, map[string]any{
+		"requestMethod": "GET", "status": float64(http.StatusOK),
+	})
+	for _, key := range []string{"requestUrl", "remoteIp", "userAgent"} {
+		if _, ok := httpRequest[key]; ok {
+			t.Fatalf("GCP privacy field %q enabled by default: %#v", key, httpRequest)
+		}
+	}
+	if len(httpRequest) != 3 {
+		t.Fatalf("httpRequest = %#v, want method, status, and latency only", httpRequest)
+	}
+}
+
+func TestAccessLoggerPrivacyCaptureOptionsAreIndependent(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		config    AccessLoggerConfig
+		portable  string
+		provider  string
+		wantValue string
+	}{
+		{"path", AccessLoggerConfig{CapturePath: true}, "path", "requestUrl", "/private"},
+		{"peer IP", AccessLoggerConfig{CapturePeerIP: true}, "peer_ip", "remoteIp", "203.0.113.9"},
+		{"user agent", AccessLoggerConfig{CaptureUserAgent: true}, "user_agent", "userAgent", "privacy-canary"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var buffer bytes.Buffer
+			logger := newTestLogger(t, LoggerConfig{Preset: PresetGCP, Writer: &buffer})
+			e := echo.New()
+			tt.config.Logger = logger
+			tt.config.Preset = PresetGCP
+			e.Use(AccessLogger(tt.config))
+			e.GET("/private", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/private?secret=yes", nil)
+			req.RemoteAddr = "203.0.113.9:4321"
+			req.Header.Set("User-Agent", "privacy-canary")
+			e.ServeHTTP(httptest.NewRecorder(), req)
+
+			entry := decodeSingleLogLine(t, buffer.String())
+			assertFields(t, entry, map[string]any{tt.portable: tt.wantValue})
+			for _, key := range []string{"path", "peer_ip", "user_agent"} {
+				if key != tt.portable {
+					if _, ok := entry[key]; ok {
+						t.Fatalf("capture option enabled %q: %#v", key, entry)
+					}
+				}
+			}
+			httpRequest, ok := entry["httpRequest"].(map[string]any)
+			if !ok {
+				t.Fatalf("httpRequest missing or wrong type: %#v", entry["httpRequest"])
+			}
+			assertFields(t, httpRequest, map[string]any{tt.provider: tt.wantValue})
+			for _, key := range []string{"requestUrl", "remoteIp", "userAgent"} {
+				if key != tt.provider {
+					if _, ok := httpRequest[key]; ok {
+						t.Fatalf("capture option enabled GCP field %q: %#v", key, httpRequest)
+					}
+				}
+			}
+		})
 	}
 }
 
@@ -167,24 +330,95 @@ func TestDefaultStatusLevelUsesExactHTTPClassBoundaries(t *testing.T) {
 	}
 }
 
-func TestAccessLoggerMapsHandlerErrorsToWireStatusLevelAndExactError(t *testing.T) {
+func TestAccessLoggerContainsTelemetryCallbackPanics(t *testing.T) {
+	t.Run("status mapper uses default", func(t *testing.T) {
+		var buffer bytes.Buffer
+		logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+		e := echo.New()
+		e.Use(AccessLogger(AccessLoggerConfig{
+			Logger: logger,
+			StatusLevel: func(int) zapcore.Level {
+				panic("status mapper failed")
+			},
+		}))
+		e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusNotFound) })
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("response status = %d, want %d", rec.Code, http.StatusNotFound)
+		}
+		entry := decodeSingleLogLine(t, buffer.String())
+		assertFields(t, entry, map[string]any{"level": "WARN", "status": float64(http.StatusNotFound)})
+	})
+
+	t.Run("clock and enrichment use safe values", func(t *testing.T) {
+		var buffer bytes.Buffer
+		logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+		clockCalls := 0
+		e := echo.New()
+		e.Use(AccessLogger(AccessLoggerConfig{
+			Logger: logger,
+			Now: func() time.Time {
+				clockCalls++
+				if clockCalls == 1 {
+					return time.Unix(0, 0)
+				}
+				panic("clock failed")
+			},
+			ExtraFields: func(*echo.Context) []zap.Field {
+				panic("enrichment failed")
+			},
+		}))
+		e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusAccepted) })
+		rec := httptest.NewRecorder()
+		e.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
+
+		if rec.Code != http.StatusAccepted {
+			t.Fatalf("response status = %d, want %d", rec.Code, http.StatusAccepted)
+		}
+		entry := decodeSingleLogLine(t, buffer.String())
+		assertFields(t, entry, map[string]any{"duration_ms": float64(0), "status": float64(http.StatusAccepted)})
+		if _, ok := entry["tenant_id"]; ok {
+			t.Fatalf("failed enrichment leaked fields: %#v", entry)
+		}
+	})
+}
+
+func TestAccessLoggerContainsWriterPanicWithoutChangingResponse(t *testing.T) {
+	logger := newTestLogger(t, LoggerConfig{Writer: panickingWriter{value: "writer failed"}})
+	e := echo.New()
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) })
+	rec := httptest.NewRecorder()
+
+	e.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
+
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("response status = %d, want %d", rec.Code, http.StatusNoContent)
+	}
+}
+
+func TestAccessLoggerDoesNotClaimStatusesProducedAfterReturnedHandlerErrors(t *testing.T) {
 	t.Parallel()
 	httpErr := echo.NewHTTPError(http.StatusBadRequest, "bad input")
 	plainErr := errors.New("database unavailable")
 	statusErr := &testStatusError{status: http.StatusUnprocessableEntity}
 	tests := []struct {
-		name      string
-		handler   echo.HandlerFunc
-		wantCode  int
-		wantLevel string
-		wantError string
+		name       string
+		handler    echo.HandlerFunc
+		wantCode   int
+		wantLevel  string
+		wantError  string
+		wantStatus bool
 	}{
 		{
 			"http error",
 			func(*echo.Context) error { return httpErr },
 			http.StatusBadRequest,
-			"WARN",
+			"ERROR",
 			httpErr.Error(),
+			false,
 		},
 		{
 			"plain error",
@@ -192,13 +426,15 @@ func TestAccessLoggerMapsHandlerErrorsToWireStatusLevelAndExactError(t *testing.
 			http.StatusInternalServerError,
 			"ERROR",
 			plainErr.Error(),
+			false,
 		},
 		{
 			"custom status error",
 			func(*echo.Context) error { return statusErr },
 			http.StatusUnprocessableEntity,
-			"WARN",
+			"ERROR",
 			statusErr.Error(),
+			false,
 		},
 		{
 			"success",
@@ -206,6 +442,7 @@ func TestAccessLoggerMapsHandlerErrorsToWireStatusLevelAndExactError(t *testing.
 			http.StatusNoContent,
 			"INFO",
 			"",
+			true,
 		},
 	}
 	for _, tt := range tests {
@@ -222,7 +459,14 @@ func TestAccessLoggerMapsHandlerErrorsToWireStatusLevelAndExactError(t *testing.
 				t.Fatalf("wire status = %d, want %d", rec.Code, tt.wantCode)
 			}
 			entry := decodeSingleLogLine(t, buffer.String())
-			assertFields(t, entry, map[string]any{"status": float64(tt.wantCode), "level": tt.wantLevel})
+			assertFields(t, entry, map[string]any{"level": tt.wantLevel})
+			status, hasStatus := entry["status"]
+			if hasStatus != tt.wantStatus {
+				t.Fatalf("status presence = %t, want %t: %#v", hasStatus, tt.wantStatus, entry)
+			}
+			if tt.wantStatus && status != float64(tt.wantCode) {
+				t.Fatalf("status = %#v, want %d: %#v", status, tt.wantCode, entry)
+			}
 			gotError, hasError := entry["error"]
 			if tt.wantError == "" {
 				if hasError {
@@ -230,6 +474,13 @@ func TestAccessLoggerMapsHandlerErrorsToWireStatusLevelAndExactError(t *testing.
 				}
 			} else if !hasError || gotError != tt.wantError {
 				t.Fatalf("error = %#v, want %q: %#v", gotError, tt.wantError, entry)
+			}
+			if tt.wantError == "" {
+				if _, ok := entry["terminal_reason"]; ok {
+					t.Fatalf("successful request emitted terminal reason: %#v", entry)
+				}
+			} else if entry["terminal_reason"] != "service_error" {
+				t.Fatalf("terminal_reason = %#v, want service_error: %#v", entry["terminal_reason"], entry)
 			}
 		})
 	}
@@ -251,11 +502,80 @@ func TestAccessLoggerCommittedStatusWinsReturnedError(t *testing.T) {
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
 	entry := decodeSingleLogLine(t, buffer.String())
-	if rec.Code != http.StatusAccepted || entry["status"] != float64(http.StatusAccepted) || entry["level"] != "INFO" {
+	if rec.Code != http.StatusAccepted || entry["status"] != float64(http.StatusAccepted) ||
+		entry["level"] != "ERROR" || entry["terminal_reason"] != "service_error" {
 		t.Fatalf("unexpected entry: %#v", entry)
 	}
 	if got := entry["error"]; got != lateErr.Error() {
 		t.Fatalf("committed response error = %#v, want %q: %#v", got, lateErr.Error(), entry)
+	}
+}
+
+func TestAccessLoggerNormalReturnWithoutCommittedResponseOmitsStatus(t *testing.T) {
+	t.Parallel()
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	statusLevelCalls := 0
+	e := echo.New()
+	e.Use(AccessLogger(AccessLoggerConfig{
+		Logger: logger,
+		StatusLevel: func(int) zapcore.Level {
+			statusLevelCalls++
+			return zap.DebugLevel
+		},
+	}))
+	e.GET("/", func(*echo.Context) error { return nil })
+	e.ServeHTTP(
+		httptest.NewRecorder(),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil),
+	)
+	entry := decodeSingleLogLine(t, buffer.String())
+	if entry["level"] != "INFO" || statusLevelCalls != 0 {
+		t.Fatalf("normal uncommitted outcome = %#v, status-level calls = %d", entry, statusLevelCalls)
+	}
+	if _, ok := entry["status"]; ok {
+		t.Fatalf("normal uncommitted outcome inferred status: %#v", entry)
+	}
+	if _, ok := entry["terminal_reason"]; ok {
+		t.Fatalf("normal uncommitted outcome emitted terminal reason: %#v", entry)
+	}
+}
+
+func TestAccessLoggerGCPServiceErrorOmitsUnobservedStatusAndForcesError(t *testing.T) {
+	t.Parallel()
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Preset: PresetGCP, Writer: &buffer})
+	statusLevelCalls := 0
+	e := echo.New()
+	e.Use(AccessLogger(AccessLoggerConfig{
+		Logger: logger,
+		Preset: PresetGCP,
+		StatusLevel: func(int) zapcore.Level {
+			statusLevelCalls++
+			return zap.DebugLevel
+		},
+	}))
+	e.GET("/", func(*echo.Context) error { return errors.New("service failed") })
+	e.ServeHTTP(
+		httptest.NewRecorder(),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil),
+	)
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{
+		"severity": "ERROR", "terminal_reason": "service_error", "error": "service failed",
+	})
+	if statusLevelCalls != 0 {
+		t.Fatalf("abnormal outcome invoked status-level callback %d times", statusLevelCalls)
+	}
+	if _, ok := entry["status"]; ok {
+		t.Fatalf("service error inferred top-level status: %#v", entry)
+	}
+	httpRequest, ok := entry["httpRequest"].(map[string]any)
+	if !ok {
+		t.Fatalf("httpRequest = %#v, want object", entry["httpRequest"])
+	}
+	if _, ok := httpRequest["status"]; ok {
+		t.Fatalf("service error inferred GCP status: %#v", httpRequest)
 	}
 }
 
@@ -264,7 +584,7 @@ func TestAccessLoggerFallbackMetadataAnd404(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 	e := echo.New()
-	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger, CapturePath: true}))
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/missing/123", nil))
 	entry := decodeSingleLogLine(t, buffer.String())
@@ -276,7 +596,8 @@ func TestAccessLoggerFallbackMetadataAnd404(t *testing.T) {
 	if entry["correlation_id"] != loggedID {
 		t.Fatalf("fallback correlation ID does not match request ID: %#v", entry)
 	}
-	if entry["status"] != float64(http.StatusNotFound) || entry["path"] != "/missing/123" {
+	if _, ok := entry["status"]; ok || entry["terminal_reason"] != "service_error" ||
+		entry["level"] != "ERROR" || entry["path"] != "/missing/123" {
 		t.Fatalf("unexpected 404 entry: %#v", entry)
 	}
 	if _, ok := entry["path_template"]; ok {
@@ -292,16 +613,53 @@ func TestAccessLoggerUnnamedRouteKeepsEscapedPathWithoutOperationID(t *testing.T
 	var buffer bytes.Buffer
 	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 	e := echo.New()
-	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger, CapturePath: true}))
 	e.GET("/files/*", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/files/a%2Fb?download=true", nil)
-	e.ServeHTTP(httptest.NewRecorder(), req)
-	entry := decodeSingleLogLine(t, buffer.String())
-	if entry["path"] != "/files/a%2Fb" || entry["path_template"] != "/files/*" {
-		t.Fatalf("unexpected route paths: %#v", entry)
+	for _, target := range []string{"/files/a%2Fb?download=true", "/files/tenant-b/two"} {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil)
+		e.ServeHTTP(httptest.NewRecorder(), req)
 	}
-	if _, ok := entry["operation_id"]; ok {
-		t.Fatalf("unnamed route emitted Echo's synthetic operation ID: %#v", entry)
+	entries := decodeLogLines(t, buffer.String())
+	if len(entries) != 2 || entries[0]["path"] != "/files/a%2Fb" || entries[1]["path"] != "/files/tenant-b/two" {
+		t.Fatalf("unexpected concrete route paths: %#v", entries)
+	}
+	for _, entry := range entries {
+		if entry["path_template"] != "/files/{*path}" {
+			t.Fatalf("catch-all template changed with request data: %#v", entries)
+		}
+		if _, ok := entry["operation_id"]; ok {
+			t.Fatalf("unnamed route emitted Echo's synthetic operation ID: %#v", entry)
+		}
+	}
+}
+
+func TestAccessLoggerRepresentativeRouteIdentityHasStableCardinality(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	e := echo.New()
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	for _, route := range []echo.Route{
+		{Method: http.MethodGet, Path: "/items/:item_id", Name: "get_item", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
+		{Method: http.MethodGet, Path: "/files/*", Name: "get_file", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
+	} {
+		if _, err := e.AddRoute(route); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, target := range []string{"/items/tenant-a", "/items/tenant-b", "/files/tenant-a/one", "/files/tenant-b/two"} {
+		e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil))
+	}
+	entries := decodeLogLines(t, buffer.String())
+	if len(entries) != 4 {
+		t.Fatalf("log line count = %d, want 4", len(entries))
+	}
+	for _, entry := range entries[:2] {
+		assertFields(t, entry, map[string]any{"path_template": "/items/{item_id}", "operation_id": "get_item"})
+	}
+	for _, entry := range entries[2:] {
+		assertFields(t, entry, map[string]any{"path_template": "/files/{*path}", "operation_id": "get_file"})
 	}
 }
 
@@ -315,14 +673,67 @@ func TestAccessLogger405OmitsSyntheticRouteMetadata(t *testing.T) {
 	rec := httptest.NewRecorder()
 	e.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/users/123", nil))
 	entry := decodeSingleLogLine(t, buffer.String())
-	if rec.Code != http.StatusMethodNotAllowed || entry["status"] != float64(http.StatusMethodNotAllowed) {
+	if rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("unexpected 405 response: code=%d entry=%#v", rec.Code, entry)
 	}
-	if entry["path_template"] != "/users/:id" {
+	if _, ok := entry["status"]; ok {
+		t.Fatalf("unobserved centralized 405 status was logged: %#v", entry)
+	}
+	if entry["terminal_reason"] != "service_error" || entry["level"] != "ERROR" {
+		t.Fatalf("unexpected 405 terminal outcome: %#v", entry)
+	}
+	if entry["path_template"] != "/users/{id}" {
 		t.Fatalf("method-not-allowed route lost matched path_template: %#v", entry)
 	}
 	if _, ok := entry["operation_id"]; ok {
 		t.Fatalf("method-not-allowed route emitted operation_id: %#v", entry)
+	}
+}
+
+func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		native string
+		want   string
+		ok     bool
+	}{
+		{native: "/health", want: "/health", ok: true},
+		{native: "/items/:item_id", want: "/items/{item_id}", ok: true},
+		{native: "/files/*", want: "/files/{*path}", ok: true},
+		{native: "*", want: "/{*path}", ok: true},
+		{native: "/items/:item_id?"},
+		{native: "/items/:item_id.:format"},
+		{native: "/files/*/suffix"},
+	} {
+		t.Run(test.native, func(t *testing.T) {
+			t.Parallel()
+			got, ok := canonicalRouteTemplate(test.native)
+			if got != test.want || ok != test.ok {
+				t.Fatalf(
+					"canonicalRouteTemplate(%q) = (%q, %v), want (%q, %v)",
+					test.native, got, ok, test.want, test.ok,
+				)
+			}
+		})
+	}
+	for _, name := range []string{"A", "Z", "a", "z", "_", "a0", "a9", strings.Repeat("a", 64)} {
+		t.Run("valid-name-"+name, func(t *testing.T) {
+			t.Parallel()
+			native := "/items/:" + name
+			want := "/items/{" + name + "}"
+			if got, ok := canonicalRouteTemplate(native); !ok || got != want {
+				t.Fatalf("canonicalRouteTemplate(%q) = (%q, %v), want (%q, true)", native, got, ok, want)
+			}
+		})
+	}
+	for _, name := range []string{"", "0a", "9a", "@a", "[a", "`a", "{a", "a.", "a:", strings.Repeat("a", 65)} {
+		t.Run("invalid-name-"+name, func(t *testing.T) {
+			t.Parallel()
+			if got, ok := canonicalRouteTemplate("/items/:" + name); ok || got != "" {
+				t.Fatalf("invalid parameter name %q produced (%q, %v)", name, got, ok)
+			}
+		})
 	}
 }
 
@@ -401,8 +812,11 @@ func TestAccessLoggerLogsAndRethrowsPanic(t *testing.T) {
 	}
 	entry := decodeSingleLogLine(t, buffer.String())
 	assertFields(t, entry, map[string]any{
-		"message": "request completed", "status": float64(http.StatusInternalServerError), "level": "ERROR",
+		"message": "request completed", "terminal_reason": "panic", "level": "ERROR",
 	})
+	if _, ok := entry["status"]; ok {
+		t.Fatalf("uncommitted panic emitted inferred status: %#v", entry)
+	}
 }
 
 func TestAccessLoggerPreservesCommittedStatusAndRethrowsPanic(t *testing.T) {
@@ -436,7 +850,8 @@ func TestAccessLoggerPreservesCommittedStatusAndRethrowsPanic(t *testing.T) {
 	}
 	entry := decodeSingleLogLine(t, buffer.String())
 	assertFields(t, entry, map[string]any{
-		"message": "request completed", "status": float64(http.StatusAccepted), "level": "INFO",
+		"message": "request completed", "status": float64(http.StatusAccepted),
+		"terminal_reason": "panic", "level": "ERROR",
 	})
 }
 
@@ -449,7 +864,6 @@ func TestAccessLoggerPreservesHandlerPanicWhenAccessLoggingPanics(t *testing.T) 
 		name  string
 		stage string
 	}{
-		{name: "status level callback", stage: "status"},
 		{name: "enrichment callback", stage: "enrichment"},
 		{name: "log writer", stage: "writer"},
 	} {
@@ -464,10 +878,6 @@ func TestAccessLoggerPreservesHandlerPanicWhenAccessLoggingPanics(t *testing.T) 
 			logger := newTestLogger(t, LoggerConfig{Writer: writer})
 			config := AccessLoggerConfig{Logger: logger}
 			switch tt.stage {
-			case "status":
-				config.StatusLevel = func(int) zapcore.Level {
-					panic(loggingPanic)
-				}
 			case "enrichment":
 				config.ExtraFields = func(*echo.Context) []zap.Field {
 					panic(loggingPanic)
@@ -492,6 +902,17 @@ func TestAccessLoggerPreservesHandlerPanicWhenAccessLoggingPanics(t *testing.T) 
 				t.Fatalf("recovered panic = %#v, want original %#v", recovered, handlerPanic)
 			}
 		})
+	}
+}
+
+func TestContainAccessLogReportsCompletion(t *testing.T) {
+	t.Parallel()
+
+	if !containAccessLog(func() {}) {
+		t.Fatal("containAccessLog reported failure for a completed write")
+	}
+	if containAccessLog(func() { panic("writer failed") }) {
+		t.Fatal("containAccessLog reported completion for a panicking write")
 	}
 }
 
@@ -528,8 +949,11 @@ func TestAccessLoggerCloudPresets(t *testing.T) {
 			e := echo.New()
 			e.Use(RequestContext(RequestContextConfig{Logger: logger, Preset: tt.preset}))
 			e.Use(AccessLogger(AccessLoggerConfig{
-				Logger: logger,
-				Preset: tt.preset,
+				Logger:           logger,
+				Preset:           tt.preset,
+				CapturePath:      true,
+				CapturePeerIP:    true,
+				CaptureUserAgent: true,
 				Now: fixedClock(
 					time.Unix(0, 0),
 					time.Unix(0, int64(1500*time.Millisecond)),
@@ -549,7 +973,7 @@ func TestAccessLoggerCloudPresets(t *testing.T) {
 					t.Fatalf("unexpected httpRequest: %#v", entry["httpRequest"])
 				}
 				assertFields(t, httpRequest, map[string]any{
-					"requestMethod": "GET", "requestUrl": "https://example.com/cloud?x=1",
+					"requestMethod": "GET", "requestUrl": "/cloud",
 					"status": float64(http.StatusOK), "userAgent": "cloud-test",
 					"remoteIp": "203.0.113.9", "latency": "1.5s",
 				})
@@ -749,17 +1173,21 @@ func TestAccessLoggerFiltersReservedFields(t *testing.T) {
 		"timestamp", "level", "severity", "logger", "message", "error",
 		"request_id", "correlation_id", "trace_id", "parent_id", "trace_flags", "trace_sampled",
 		"method", "path", "path_template", "operation_id", "status", "duration_ms",
-		"remote_ip", "user_agent", "httpRequest",
+		"terminal_reason", "peer_ip", "remote_ip", "user_agent", "httpRequest",
 	}
 	e := echo.New()
 	e.Use(AccessLogger(AccessLoggerConfig{
 		Logger: logger,
 		ExtraFields: func(*echo.Context) []zap.Field {
-			fields := make([]zap.Field, 0, len(reservedKeys)+1)
+			fields := make([]zap.Field, 0, len(reservedKeys)+2)
 			for _, key := range reservedKeys {
 				fields = append(fields, zap.String(key, "forged-"+key))
 			}
-			return append(fields, zap.String("tenant_id", "tenant-1"))
+			return append(
+				fields,
+				zap.String("tenant_id", "tenant-1"),
+				zap.String("tenant_id", "tenant-2"),
+			)
 		},
 	}))
 	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
@@ -771,6 +1199,9 @@ func TestAccessLoggerFiltersReservedFields(t *testing.T) {
 	entry := decodeSingleLogLine(t, line)
 	if entry["tenant_id"] != "tenant-1" {
 		t.Fatalf("custom field missing: %#v", entry)
+	}
+	if count := strings.Count(line, `"tenant_id"`); count != 1 {
+		t.Fatalf("tenant_id count = %d, want 1: %s", count, line)
 	}
 }
 
@@ -944,22 +1375,74 @@ func TestRequestPathFallsBackToOpaqueThenRoot(t *testing.T) {
 	}
 }
 
-func TestRequestURLUsesForwardedSchemeAndRelativeFallback(t *testing.T) {
+func TestDirectPeerIPNormalizesTransportAddressOnly(t *testing.T) {
 	t.Parallel()
-	e := echo.New()
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
-	req.URL.Path = ""
-	req.Host = ""
-	if got := requestURL(e.NewContext(req, httptest.NewRecorder())); got != "/" {
-		t.Fatalf("relative request URL = %q, want /", got)
+	tests := []struct {
+		name string
+		addr string
+		want string
+	}{
+		{"empty", "", ""},
+		{"IPv4 with port", "203.0.113.9:4321", "203.0.113.9"},
+		{"IPv6 with port", "[2001:db8::1]:443", "2001:db8::1"},
+		{"bare IPv6", "2001:db8::1", "2001:db8::1"},
+		{"bracketed IPv6", "[2001:db8::1]", "2001:db8::1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := directPeerIP(tt.addr); got != tt.want {
+				t.Fatalf("directPeerIP(%q) = %q, want %q", tt.addr, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAccessLoggerResolvesAndValidatesGCPProfileVersionAtConstruction(t *testing.T) {
+	t.Parallel()
+	latest := normalizeAccessLoggerConfig(AccessLoggerConfig{Preset: PresetGCP})
+	pinned := normalizeAccessLoggerConfig(AccessLoggerConfig{
+		Preset:            PresetGCP,
+		GCPProfileVersion: GCPProfileVersionV0_1_0,
+	})
+	if latest.GCPProfileVersion != GCPProfileVersionV0_1_0 ||
+		pinned.GCPProfileVersion != GCPProfileVersionV0_1_0 {
+		t.Fatalf(
+			"resolved versions = (%q, %q), want %q",
+			latest.GCPProfileVersion,
+			pinned.GCPProfileVersion,
+			GCPProfileVersionV0_1_0,
+		)
 	}
 
-	proxied := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "http://example.com/secure?x=1", nil)
-	proxied.URL.Scheme = ""
-	proxied.URL.Host = ""
-	proxied.Header.Set(echo.HeaderXForwardedProto, "https")
-	if got := requestURL(e.NewContext(proxied, httptest.NewRecorder())); got != "https://example.com/secure?x=1" {
-		t.Fatalf("proxied request URL = %q, want https URL", got)
+	tests := []struct {
+		name   string
+		config AccessLoggerConfig
+		want   string
+	}{
+		{
+			name:   "unsupported version",
+			config: AccessLoggerConfig{Preset: PresetGCP, GCPProfileVersion: "0.2.0"},
+			want:   `observability: unsupported GCP profile version "0.2.0"`,
+		},
+		{
+			name:   "cross-preset version",
+			config: AccessLoggerConfig{Preset: PresetAWS, GCPProfileVersion: GCPProfileVersionV0_1_0},
+			want:   "observability: GCP profile version requires GCP preset",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			defer func() {
+				recovered := recover()
+				err, ok := recovered.(error)
+				if !ok || err.Error() != tt.want {
+					t.Fatalf("AccessLogger panic = %#v, want %q", recovered, tt.want)
+				}
+			}()
+			AccessLogger(tt.config)
+		})
 	}
 }
 

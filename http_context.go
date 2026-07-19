@@ -11,6 +11,7 @@ type HTTPRequestContextConfig struct {
 	RequestIDHeader       string
 	TraceparentHeader     string
 	TracestateHeader      string
+	TraceContextLevel     TraceContextLevel
 	ResponseHeader        string
 	DisableResponseHeader bool
 	NewRequestID          func() string
@@ -64,6 +65,7 @@ func normalizeHTTPRequestContextConfig(config HTTPRequestContextConfig) normaliz
 		RequestIDHeader:       config.RequestIDHeader,
 		TraceparentHeader:     config.TraceparentHeader,
 		TracestateHeader:      config.TracestateHeader,
+		TraceContextLevel:     config.TraceContextLevel,
 		ResponseHeader:        config.ResponseHeader,
 		DisableResponseHeader: config.DisableResponseHeader,
 		NewRequestID:          config.NewRequestID,

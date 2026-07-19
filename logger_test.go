@@ -71,6 +71,44 @@ func TestNewLoggerRejectsUnknownPreset(t *testing.T) {
 	}
 }
 
+func TestGCPProfileVersionResolutionAndLoggerValidation(t *testing.T) {
+	t.Parallel()
+	latest, err := ResolveGCPProfileVersion(PresetGCP, "")
+	if err != nil || latest != GCPProfileVersionV0_1_0 {
+		t.Fatalf("latest GCP profile = (%q, %v), want %q", latest, err, GCPProfileVersionV0_1_0)
+	}
+	pinned, err := ResolveGCPProfileVersion(PresetGCP, GCPProfileVersionV0_1_0)
+	if err != nil || pinned != GCPProfileVersionV0_1_0 {
+		t.Fatalf("pinned GCP profile = (%q, %v), want %q", pinned, err, GCPProfileVersionV0_1_0)
+	}
+
+	tests := []struct {
+		name   string
+		config LoggerConfig
+		want   string
+	}{
+		{
+			name:   "unsupported version",
+			config: LoggerConfig{Preset: PresetGCP, GCPProfileVersion: "0.2.0"},
+			want:   `observability: unsupported GCP profile version "0.2.0"`,
+		},
+		{
+			name:   "cross-preset version",
+			config: LoggerConfig{Preset: PresetAWS, GCPProfileVersion: GCPProfileVersionV0_1_0},
+			want:   "observability: GCP profile version requires GCP preset",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			logger, err := NewLogger(tt.config)
+			if logger != nil || err == nil || err.Error() != tt.want {
+				t.Fatalf("NewLogger(invalid) = (%#v, %v), want nil and %q", logger, err, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewLoggerWritesNamedLoggerField(t *testing.T) {
 	t.Parallel()
 	var buffer bytes.Buffer
@@ -90,7 +128,11 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 		{},
 		{
 			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
-			Flags: "01", Sampled: true, Valid: true,
+			Flags: "01", Sampled: true, Level: TraceContextLevel1, Valid: true,
+		},
+		{
+			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
+			Flags: "03", Sampled: true, Random: true, Level: TraceContextLevel2, Valid: true,
 		},
 	} {
 		var buffer bytes.Buffer
@@ -105,7 +147,7 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 		if entry["request_id"] != "req-1" || entry["correlation_id"] != "corr-1" {
 			t.Fatalf("request metadata fields = %#v", entry)
 		}
-		traceFields := []string{"trace_id", "parent_id", "trace_flags", "trace_sampled"}
+		traceFields := []string{"trace_id", "parent_id", "trace_flags", "trace_sampled", "trace_id_random"}
 		if !trace.Valid {
 			for _, key := range traceFields {
 				if _, ok := entry[key]; ok {
@@ -122,6 +164,13 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 			if entry[key] != value {
 				t.Fatalf("%s = %#v, want %#v; entry=%#v", key, entry[key], value, entry)
 			}
+		}
+		if trace.Level == TraceContextLevel2 {
+			if entry["trace_id_random"] != trace.Random {
+				t.Fatalf("trace_id_random = %#v, want %#v; entry=%#v", entry["trace_id_random"], trace.Random, entry)
+			}
+		} else if _, ok := entry["trace_id_random"]; ok {
+			t.Fatalf("Level 1 emitted trace_id_random: %#v", entry)
 		}
 	}
 }
