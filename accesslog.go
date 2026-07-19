@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -26,6 +27,7 @@ type AccessLoggerConfig struct {
 	CapturePath       bool
 	CapturePeerIP     bool
 	CaptureUserAgent  bool
+	CaptureError      bool
 	Now               func() time.Time
 	StatusLevel       StatusLeveler
 	ExtraFields       func(*echo.Context) []zap.Field
@@ -64,7 +66,7 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 					}
 					duration := safeDuration(cfg.Now, start, startOK)
 					fields := accessLogFields(c, status, hasStatus, terminalReason, duration, cfg)
-					if err != nil {
+					if err != nil && cfg.CaptureError {
 						fields = append(fields, zap.Error(err))
 					}
 					if cfg.ExtraFields != nil {
@@ -162,7 +164,13 @@ func safeStatusLevel(mapper StatusLeveler, status int) (level zapcore.Level) {
 			level = DefaultStatusLevel(status)
 		}
 	}()
-	return mapper(status)
+	level = mapper(status)
+	switch level {
+	case zapcore.DebugLevel, zapcore.InfoLevel, zapcore.WarnLevel, zapcore.ErrorLevel:
+		return level
+	default:
+		return DefaultStatusLevel(status)
+	}
 }
 
 func safeExtraFields(callback func(*echo.Context) []zap.Field, c *echo.Context) (fields []zap.Field) {
@@ -254,13 +262,16 @@ func accessLogFields(
 	path := ""
 	if config.CapturePath {
 		path = requestPath(req)
-		fields = append(fields, zap.String("path", path))
+		if path != "" {
+			fields = append(fields, zap.String("path", path))
+		}
 	}
 	if pathTemplate, ok := canonicalRouteTemplate(c.Path()); ok {
 		fields = append(fields, zap.String("path_template", pathTemplate))
 	}
 	route := c.RouteInfo()
-	if routeName := route.Name; isExplicitRouteName(routeName, route.Method, route.Path) {
+	if routeName := route.Name; isExplicitRouteName(routeName, route.Method, route.Path) &&
+		validMetadataString(routeName) {
 		fields = append(fields, zap.String("operation_id", routeName))
 	}
 	peerIP := ""
@@ -272,7 +283,7 @@ func accessLogFields(
 	}
 	userAgent := ""
 	if config.CaptureUserAgent {
-		userAgent = req.UserAgent()
+		userAgent, _ = singleValidHeaderValue(req.Header.Values("User-Agent"))
 	}
 	if userAgent != "" {
 		fields = append(fields, zap.String("user_agent", userAgent))
@@ -288,6 +299,25 @@ func accessLogFields(
 		}))
 	}
 	return fields
+}
+
+func validMetadataString(value string) bool {
+	if value == "" {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func singleValidHeaderValue(values []string) (string, bool) {
+	if len(values) != 1 || !validMetadataString(values[0]) {
+		return "", false
+	}
+	return values[0], true
 }
 
 func isExplicitRouteName(name, method, path string) bool {
@@ -374,26 +404,37 @@ func isReservedLogField(key string) bool {
 }
 
 func requestPath(req *http.Request) string {
-	if req.URL.Path != "" {
-		return req.URL.EscapedPath()
+	if req == nil || req.URL == nil || req.URL.Path == "" {
+		return ""
 	}
-	if req.URL.Opaque != "" {
-		return req.URL.Opaque
+	path := req.URL.EscapedPath()
+	if req.URL.RawPath != "" && path != req.URL.RawPath {
+		return ""
 	}
-	return "/"
+	if !strings.HasPrefix(path, "/") || strings.Contains(path, "#") {
+		return ""
+	}
+	return path
 }
 
 func directPeerIP(remoteAddr string) string {
 	if remoteAddr == "" {
 		return ""
 	}
-	if host, _, err := net.SplitHostPort(remoteAddr); err == nil {
-		return strings.Trim(host, "[]")
+	host := remoteAddr
+	if splitHost, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = splitHost
+	} else if strings.HasPrefix(remoteAddr, "[") && strings.HasSuffix(remoteAddr, "]") {
+		host = strings.TrimSuffix(strings.TrimPrefix(remoteAddr, "["), "]")
 	}
-	if strings.HasPrefix(remoteAddr, "[") && strings.Contains(remoteAddr, "]") {
-		return strings.TrimPrefix(strings.SplitN(remoteAddr, "]", 2)[0], "[")
+	if strings.Contains(host, "%") {
+		return ""
 	}
-	return remoteAddr
+	address, err := netip.ParseAddr(host)
+	if err != nil {
+		return ""
+	}
+	return address.String()
 }
 
 func gcpTraceFields(trace TraceContext) []zap.Field {

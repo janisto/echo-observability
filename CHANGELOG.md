@@ -37,6 +37,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   so package-controlled JSON contains no duplicate member names.
 - **Breaking:** Canonicalize Echo `:name` and terminal `*` route metadata to
   portable `{name}` and `{*path}` templates; omit ambiguous native forms.
+- Fold every GCP severity into the portable five-level vocabulary, reject
+  terminal or unknown status-callback levels, omit unavailable request paths,
+  and emit only canonical unzoned IP address literals for direct peers.
 
 ## [1.0.1] - 2026-07-17
 

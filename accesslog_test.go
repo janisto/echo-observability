@@ -385,6 +385,25 @@ func TestAccessLoggerContainsTelemetryCallbackPanics(t *testing.T) {
 	})
 }
 
+func TestSafeStatusLevelRejectsTerminalAndUnknownLevels(t *testing.T) {
+	t.Parallel()
+
+	for _, level := range []zapcore.Level{
+		zapcore.DPanicLevel,
+		zapcore.PanicLevel,
+		zapcore.FatalLevel,
+		zapcore.Level(99),
+	} {
+		t.Run(level.String(), func(t *testing.T) {
+			t.Parallel()
+			got := safeStatusLevel(func(int) zapcore.Level { return level }, http.StatusNotFound)
+			if got != zapcore.WarnLevel {
+				t.Fatalf("safeStatusLevel returned %s, want WARN fallback", got)
+			}
+		})
+	}
+}
+
 func TestAccessLoggerContainsWriterPanicWithoutChangingResponse(t *testing.T) {
 	logger := newTestLogger(t, LoggerConfig{Writer: panickingWriter{value: "writer failed"}})
 	e := echo.New()
@@ -451,7 +470,7 @@ func TestAccessLoggerDoesNotClaimStatusesProducedAfterReturnedHandlerErrors(t *t
 			var buffer bytes.Buffer
 			logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 			e := echo.New()
-			e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+			e.Use(AccessLogger(AccessLoggerConfig{Logger: logger, CaptureError: true}))
 			e.GET("/test", tt.handler)
 			rec := httptest.NewRecorder()
 			e.ServeHTTP(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/test", nil))
@@ -491,7 +510,7 @@ func TestAccessLoggerCommittedStatusWinsReturnedError(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 	e := echo.New()
-	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger, CaptureError: true}))
 	lateErr := echo.NewHTTPError(http.StatusBadRequest, "too late")
 	e.GET("/", func(c *echo.Context) error {
 		if err := c.NoContent(http.StatusAccepted); err != nil {
@@ -548,8 +567,9 @@ func TestAccessLoggerGCPServiceErrorOmitsUnobservedStatusAndForcesError(t *testi
 	statusLevelCalls := 0
 	e := echo.New()
 	e.Use(AccessLogger(AccessLoggerConfig{
-		Logger: logger,
-		Preset: PresetGCP,
+		Logger:       logger,
+		Preset:       PresetGCP,
+		CaptureError: true,
 		StatusLevel: func(int) zapcore.Level {
 			statusLevelCalls++
 			return zap.DebugLevel
@@ -576,6 +596,37 @@ func TestAccessLoggerGCPServiceErrorOmitsUnobservedStatusAndForcesError(t *testi
 	}
 	if _, ok := httpRequest["status"]; ok {
 		t.Fatalf("service error inferred GCP status: %#v", httpRequest)
+	}
+}
+
+func TestAccessLoggerOmitsReturnedErrorDetailsByDefault(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name   string
+		preset Preset
+	}{
+		{name: "default", preset: PresetDefault},
+		{name: "gcp", preset: PresetGCP},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var buffer bytes.Buffer
+			logger := newTestLogger(t, LoggerConfig{Preset: test.preset, Writer: &buffer})
+			e := echo.New()
+			e.Use(AccessLogger(AccessLoggerConfig{Logger: logger, Preset: test.preset}))
+			e.GET("/", func(*echo.Context) error { return errors.New("ERROR_SECRET") })
+			e.ServeHTTP(
+				httptest.NewRecorder(),
+				httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil),
+			)
+			entry := decodeSingleLogLine(t, buffer.String())
+			if _, ok := entry["error"]; ok || strings.Contains(buffer.String(), "ERROR_SECRET") {
+				t.Fatalf("default access record leaked rich error details: %s", buffer.String())
+			}
+			if entry["terminal_reason"] != "service_error" {
+				t.Fatalf("terminal reason = %#v, want service_error", entry["terminal_reason"])
+			}
+		})
 	}
 }
 
@@ -660,6 +711,32 @@ func TestAccessLoggerRepresentativeRouteIdentityHasStableCardinality(t *testing.
 	}
 	for _, entry := range entries[2:] {
 		assertFields(t, entry, map[string]any{"path_template": "/files/{*path}", "operation_id": "get_file"})
+	}
+}
+
+func TestAccessMetadataStringsRejectEmptyDuplicateAndControlValues(t *testing.T) {
+	t.Parallel()
+
+	if _, ok := singleValidHeaderValue([]string{"agent/1"}); !ok {
+		t.Fatal("one valid User-Agent was rejected")
+	}
+	for _, values := range [][]string{nil, {""}, {"agent/1", "agent/1"}, {"agent/1\nforged"}} {
+		if value, ok := singleValidHeaderValue(values); ok || value != "" {
+			t.Fatalf("singleValidHeaderValue(%q) = %q, %v; want empty, false", values, value, ok)
+		}
+	}
+	if validMetadataString("get_item\nforged") {
+		t.Fatal("operation ID containing a control character was accepted")
+	}
+	for _, value := range []string{"\x1f", "\x7f"} {
+		if validMetadataString(value) {
+			t.Fatalf("metadata control boundary %q was accepted", value)
+		}
+	}
+	for _, value := range []string{" ", "~"} {
+		if !validMetadataString(value) {
+			t.Fatalf("printable metadata boundary %q was rejected", value)
+		}
 	}
 }
 
@@ -1361,17 +1438,26 @@ func TestXRayTraceIDFromW3CRequiresExactly128Bits(t *testing.T) {
 	}
 }
 
-func TestRequestPathFallsBackToOpaqueThenRoot(t *testing.T) {
+func TestRequestPathRejectsUnavailableAndNonOriginForms(t *testing.T) {
 	t.Parallel()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
 	req.URL.Path = ""
 	req.URL.Opaque = "/opaque"
-	if got := requestPath(req); got != "/opaque" {
-		t.Fatalf("opaque request path = %q, want /opaque", got)
+	if got := requestPath(req); got != "" {
+		t.Fatalf("opaque request path = %q, want omission", got)
 	}
 	req.URL.Opaque = ""
-	if got := requestPath(req); got != "/" {
-		t.Fatalf("empty request path = %q, want /", got)
+	if got := requestPath(req); got != "" {
+		t.Fatalf("empty request path = %q, want omission", got)
+	}
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/widgets/a%2Fb?secret=true", nil)
+	if got := requestPath(req); got != "/widgets/a%2Fb" {
+		t.Fatalf("escaped request path = %q, want /widgets/a%%2Fb", got)
+	}
+	req.URL.Path = "/widgets/a/b"
+	req.URL.RawPath = "/widgets/a%2G"
+	if got := requestPath(req); got != "" {
+		t.Fatalf("requestPath() repaired malformed raw path as %q", got)
 	}
 }
 
@@ -1387,6 +1473,10 @@ func TestDirectPeerIPNormalizesTransportAddressOnly(t *testing.T) {
 		{"IPv6 with port", "[2001:db8::1]:443", "2001:db8::1"},
 		{"bare IPv6", "2001:db8::1", "2001:db8::1"},
 		{"bracketed IPv6", "[2001:db8::1]", "2001:db8::1"},
+		{"expanded IPv6", "2001:0db8:0:0:0:0:0:1", "2001:db8::1"},
+		{"hostname with port", "example.com:443", ""},
+		{"bare hostname", "peer.internal", ""},
+		{"zoned IPv6", "[fe80::1%eth0]:443", ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

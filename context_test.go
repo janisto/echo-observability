@@ -45,7 +45,7 @@ func TestDefaultValidateRequestIDEnforcesASCIIAndLengthBoundaries(t *testing.T) 
 func TestRequestContextUsesCustomValidatorAndDefaultsResponseHeader(t *testing.T) {
 	t.Parallel()
 	const header = "X-Custom-Request-Id"
-	const generated = "custom-id"
+	const generated = "generated"
 
 	e := echo.New()
 	e.Use(RequestContext(RequestContextConfig{
@@ -321,22 +321,66 @@ func TestRequestContextPreservesExistingMetadataLogger(t *testing.T) {
 
 func TestNewValidRequestIDUsesSafeDefaultFormatWhenCustomGenerationFails(t *testing.T) {
 	t.Parallel()
+	calls := 0
+	id := newValidRequestID(func() string {
+		calls++
+		return "invalid value"
+	})
+	decoded, err := hex.DecodeString(id)
+	if calls != 2 || err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
+		t.Errorf("calls=%d id=%q decode_error=%v", calls, id, err)
+	}
+}
+
+func TestRequestIDHookPanicsAreContainedAndPreserveHandler(t *testing.T) {
+	t.Parallel()
+
 	for _, tt := range []struct {
 		name     string
-		validate func(string) bool
+		incoming string
+		config   RequestContextConfig
 	}{
-		{name: "default validator", validate: DefaultValidateRequestID},
-		{name: "validator rejects every candidate", validate: func(string) bool { return false }},
+		{
+			name:     "validator",
+			incoming: "caller",
+			config: RequestContextConfig{
+				NewRequestID: func() string { return "generated" },
+				ValidateRequestID: func(string) bool {
+					panic("validator secret")
+				},
+			},
+		},
+		{
+			name: "generator",
+			config: RequestContextConfig{NewRequestID: func() string {
+				panic("generator secret")
+			}},
+		},
 	} {
-		calls := 0
-		id := newValidRequestID(func() string {
-			calls++
-			return "invalid value"
-		}, tt.validate)
-		decoded, err := hex.DecodeString(id)
-		if calls != 2 || err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
-			t.Errorf("%s: calls=%d id=%q decode_error=%v", tt.name, calls, id, err)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := echo.New()
+			e.Use(RequestContext(tt.config))
+			handlerCalled := false
+			var got string
+			e.GET("/", func(c *echo.Context) error {
+				handlerCalled = true
+				got = RequestID(c.Request().Context())
+				return c.NoContent(http.StatusNoContent)
+			})
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+			if tt.incoming != "" {
+				req.Header.Set(defaultRequestIDHeader, tt.incoming)
+			}
+			recorder := httptest.NewRecorder()
+			e.ServeHTTP(recorder, req)
+			if !handlerCalled || !DefaultValidateRequestID(got) {
+				t.Fatalf("handler_called=%v request_id=%q", handlerCalled, got)
+			}
+			if recorder.Header().Get(defaultRequestIDHeader) != got {
+				t.Fatalf("response request ID does not match handler ID: %#v", recorder.Header())
+			}
+		})
 	}
 }
 

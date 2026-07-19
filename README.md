@@ -265,7 +265,7 @@ missing, but explicit installation of both middlewares is preferred. It emits:
 - `terminal_reason` — `service_error` for returned errors or `panic`
 - `peer_ip` — direct `Request.RemoteAddr` peer when `CapturePeerIP` is enabled
 - `user_agent` when `CaptureUserAgent` is enabled
-- `error` — returned Echo error, when present
+- `error` — returned Echo error only with the privacy-sensitive `CaptureError` opt-in
 
 The request-scoped fields are `request_id`, `correlation_id`, and, for valid
 W3C trace context, `trace_id`, `parent_id`, `trace_flags`, and
@@ -283,11 +283,15 @@ absent from this package's record rather than guessed from
 Use `ExtraFields` for application-owned access-log fields. Package-owned and
 provider-owned field names are ignored to prevent duplicate JSON keys.
 If the returned Zap field slice repeats a custom key, the first value wins.
+That collision guarantee applies to package-controlled context and access
+merges. Arbitrary fields passed directly to a raw Zap logger are application
+owned; callers must not reuse package-reserved names or emit duplicate keys.
 `ExtraFields` is evaluated only when the selected access-log level is enabled,
 so suppressed logs do not run application enrichment callbacks.
 
-`CapturePath`, `CapturePeerIP`, and `CaptureUserAgent` are independent and
-default to false. A provider preset never enables them. `peer_ip` ignores
+`CapturePath`, `CapturePeerIP`, `CaptureUserAgent`, and `CaptureError` are
+independent and default to false. A provider preset never enables them. Rich
+error messages can contain secrets and require an explicit privacy decision. `peer_ip` ignores
 forwarded headers and Echo's `IPExtractor`; proxy-derived client identity is a
 different, application-owned concept.
 
@@ -405,6 +409,12 @@ GCP `httpRequest.requestUrl` is the exact captured path only, never scheme,
 authority, query, or fragment. `remoteIp` and `userAgent` appear only when the
 corresponding portable privacy option is enabled.
 
+Captured paths and peers are validated rather than repaired: unavailable or
+non-origin-form paths are omitted, and peer fields contain only canonical
+unzoned IPv4 or IPv6 address literals. GCP severities always use `DEBUG`,
+`INFO`, `WARNING`, `ERROR`, or `CRITICAL`. A custom status mapper returning a
+terminal or unknown Zap level falls back to the default status mapping.
+
 ### AWS
 
 The AWS preset keeps flat `timestamp`, `level`, and `message` fields. A valid
@@ -448,7 +458,7 @@ Access lines add:
 - `terminal_reason` for returned errors and panics.
 - `peer_ip`: direct transport peer from `Request.RemoteAddr`, when opted in.
 - `user_agent` when opted in and present.
-- `error` when Echo middleware or the handler returns an error.
+- `error` when Echo middleware or the handler returns an error and `CaptureError` is enabled.
 - `httpRequest` for the GCP preset only.
 
 `ExtraFields` applies only to the access line. Reserved package and provider
@@ -462,9 +472,12 @@ lowercase hexadecimal characters. If entropy acquisition fails, or a custom
 generator returns invalid data twice, a process-local atomic fallback is used.
 
 The default validator accepts 1–128 ASCII characters from the unreserved URI
-set: letters, digits, `-`, `.`, `_`, and `~`. Invalid client input is replaced,
-never copied to response headers or logs. Applications may supply both
-`NewRequestID` and `ValidateRequestID` when they need a different contract.
+set: letters, digits, `-`, `.`, `_`, and `~`. A custom validator can only
+narrow caller input and is never applied to generated or package-fallback IDs.
+The configured generator is tried exactly twice unless its first result passes
+the baseline. Validator and generator panics are contained as rejection or
+failure and do not bypass the handler. Invalid client input is replaced, never
+copied to response headers or logs.
 
 ## Middleware Placement
 

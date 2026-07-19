@@ -186,8 +186,10 @@ func TestGCPLevelMapping(t *testing.T) {
 		{zapcore.WarnLevel, "WARNING"},
 		{zapcore.ErrorLevel, "ERROR"},
 		{zapcore.DPanicLevel, "CRITICAL"},
-		{zapcore.PanicLevel, "ALERT"},
-		{zapcore.FatalLevel, "EMERGENCY"},
+		{zapcore.PanicLevel, "CRITICAL"},
+		{zapcore.FatalLevel, "CRITICAL"},
+		{zapcore.Level(-99), "DEBUG"},
+		{zapcore.Level(99), "CRITICAL"},
 	}
 	for _, tt := range tests {
 		encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
