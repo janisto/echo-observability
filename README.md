@@ -140,12 +140,12 @@ func main() {
 	e := echo.New()
 	e.Use(
 		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: obs.PresetGCP}),
+		middleware.Recover(),
 		obs.AccessLogger(obs.AccessLoggerConfig{
 			Logger:            logger,
 			Preset:            obs.PresetGCP,
 			GCPProfileVersion: profileVersion,
 		}),
-		middleware.Recover(),
 	)
 
 	_, err = e.AddRoute(echo.Route{
@@ -177,8 +177,10 @@ func main() {
 }
 ```
 
-Install `RequestContext` before `AccessLogger`. Put recovery middleware after
-`AccessLogger` when panics must produce an access log before being recovered.
+Install `RequestContext` first, recovery middleware second, and `AccessLogger`
+third. Echo makes the first listed middleware outermost, so this order lets
+`AccessLogger` observe and rethrow a panic before recovery converts it into an
+application response.
 Echo applies `Use` middleware after routing, so `c.Path()` contains the matched
 route template. `NewLogger` defaults to info level; this example enables debug
 to show that both application levels retain the same request correlation fields
@@ -369,6 +371,7 @@ e.Use(
 	obs.RequestContext(obs.RequestContextConfig{
 		Logger: logger, Preset: obs.PresetGCP, TraceContextLevel: traceLevel,
 	}),
+	middleware.Recover(),
 	obs.AccessLogger(obs.AccessLoggerConfig{
 		Logger: logger, Preset: obs.PresetGCP, TraceContextLevel: traceLevel,
 	}),
@@ -377,9 +380,12 @@ e.Use(
 
 `ResolveTraceContextLevel(0)` exposes the effective default. Unsupported
 levels fail during middleware construction. Exactly one raw `traceparent`
-field-line is eligible. Multiple `tracestate` fields are combined in wire
-order and validated with the selected level's complete key/value grammar,
-unique keys, at most 32 members, and a 512-byte raw ceiling. Invalid
+field-line is eligible. Version `00` uses exact framing; future-version suffix
+data remains opaque native HTTP field content without a package-invented length
+ceiling. Multiple `tracestate` fields are combined in wire order and validated
+with the selected level's complete key/value grammar, unique keys, and at most
+32 members. The package can propagate at least 512 characters and admits a
+valid 513-character value; 512 is not a package rejection ceiling. Invalid
 `tracestate` is discarded without discarding a valid `traceparent`.
 For version `00`, Level 2 projects bit one of `trace_flags` as
 `trace_id_random`. Level 1 and unknown higher versions preserve the
@@ -447,11 +453,21 @@ The AWS preset keeps flat `timestamp`, `level`, and `message` fields. A valid
 W3C trace also emits `xray_trace_id` in `1-8hex-24hex` form. It does not create
 X-Ray segments or treat the incoming parent ID as a current X-Ray span.
 
+The installed package supports exact current AWS profile `0.1.0`. Omission
+resolves to it at construction; pin with `AWSProfileVersionV0_1_0` and inspect
+the effective value with `ResolveAWSProfileVersion`. Other versions and
+cross-preset pins fail without a network lookup.
+
 ### Azure
 
 The Azure preset keeps flat JSON and maps a valid W3C trace to
 `operation_Id` and `operation_ParentId`. It does not initialize Application
 Insights or create dependency/request telemetry.
+
+The installed package supports exact current Azure profile `0.1.0`. Omission
+resolves to it at construction; pin with `AzureProfileVersionV0_1_0` and
+inspect the effective value with `ResolveAzureProfileVersion`. Other versions
+and cross-preset pins fail without a network lookup.
 
 An incoming W3C parent ID is not emitted as a current span ID. A current span
 ID can only come from real tracing instrumentation.
@@ -499,12 +515,14 @@ lowercase hexadecimal characters. If entropy acquisition fails, or a custom
 generator returns invalid data twice, a process-local atomic fallback is used.
 
 The default validator accepts 1–128 ASCII characters from the unreserved URI
-set: letters, digits, `-`, `.`, `_`, and `~`. A custom validator can only
-narrow caller input and is never applied to generated or package-fallback IDs.
-The configured generator is tried exactly twice unless its first result passes
-the baseline. Validator and generator panics are contained as rejection or
-failure and do not bypass the handler. Invalid client input is replaced, never
-copied to response headers or logs.
+set: letters, digits, `-`, `.`, `_`, and `~`. A custom validator may admit a
+broader nonempty value within Go's native HTTP field-value boundary, including
+punctuation, obs-text bytes, and values longer than 128 bytes. It is never
+applied to generated or package-fallback IDs. The configured generator is tried
+exactly twice unless its first result passes the baseline. Validator and
+generator panics are contained as rejection or failure and do not bypass the
+handler. Invalid client input is replaced, never copied to response headers or
+logs.
 
 ## Middleware Placement
 
@@ -524,7 +542,6 @@ e.Use(
 	}),
 	middleware.CORS(),
 	middleware.BodyLimit(1<<20),
-	middleware.Recover(),
 )
 ```
 
@@ -570,10 +587,10 @@ unwinding, the original handler panic remains the value propagated downstream.
 On a normal handler path, a panicking clock, status mapper, enrichment callback,
 or access writer is contained: safe defaults are used when possible and the
 HTTP response is unchanged. Failed writer calls are not retried.
-Install the application's recovery
-middleware inside it—later in the `e.Use` list—when the application must turn
-panics into HTTP responses. The package never swallows a downstream handler
-panic or owns the response format.
+Install the application's recovery middleware outside it—earlier in the
+`e.Use` list—when the application must turn panics into HTTP responses while
+preserving the `panic` terminal classification. The package never swallows a
+downstream handler panic or owns the response format.
 
 ## Optional Local Wrapper
 
@@ -616,25 +633,6 @@ The suite covers the real Echo adapter path, standard `net/http` composition,
 request ID and trace boundaries, returned and committed response errors,
 panic rethrow, concurrent logging, cloud field contracts, reserved fields,
 and request-context immutability. `ParseTraceparent` also has a fuzz target.
-
-## References
-
-- [Echo v5](https://github.com/labstack/echo)
-- [Echo middleware](https://echo.labstack.com/docs/category/middleware)
-- [Echo error handling](https://echo.labstack.com/guide/error-handling/)
-- [Go 1.25 release notes](https://go.dev/doc/go1.25)
-- [W3C Trace Context](https://www.w3.org/TR/trace-context/)
-- [W3C Trace Context Level 2](https://www.w3.org/TR/2024/CRD-trace-context-2-20240328/)
-- [Zap](https://github.com/uber-go/zap)
-- [Google Cloud structured logging](https://cloud.google.com/logging/docs/structured-logging)
-- [Google Cloud trace and log integration](https://docs.cloud.google.com/trace/docs/trace-log-integration)
-- [Google Cloud Trace release notes](https://docs.cloud.google.com/trace/docs/release-notes)
-- [AWS X-Ray trace header](https://docs.aws.amazon.com/xray/latest/devguide/xray-concepts.html#xray-concepts-tracingheader)
-- [Azure Application Insights data model](https://learn.microsoft.com/azure/azure-monitor/app/data-model-complete)
-
-## License
-
-MIT. See [LICENSE](LICENSE).
 
 ## Mutation Testing
 
@@ -687,3 +685,38 @@ fix when it represents behavior the parser must preserve.
 
 See the [Go fuzzing documentation](https://go.dev/doc/security/fuzz/) for the
 engine's workflow and additional flags.
+
+## References
+
+- [Echo v5 middleware](https://echo.labstack.com/docs/category/middleware)
+  documents middleware composition around handlers.
+- [Echo context](https://echo.labstack.com/guide/context/) documents
+  request-local storage, request access, and response construction.
+- [Echo routing](https://echo.labstack.com/docs/routing) documents matched
+  route templates, named parameters, and wildcard routes.
+- [Echo error handling](https://echo.labstack.com/guide/error-handling/)
+  documents returned errors, committed responses, and centralized response
+  handling.
+- [Zap](https://pkg.go.dev/go.uber.org/zap) and
+  [`zapcore`](https://pkg.go.dev/go.uber.org/zap/zapcore) define structured
+  fields, level checks, cores, writer synchronization, and concurrency safety.
+- [W3C Trace Context Level 1 Recommendation](https://www.w3.org/TR/2021/REC-trace-context-1-20211123/)
+  defines the default `traceparent` and `tracestate` contract.
+- [W3C Trace Context Level 2 Candidate Recommendation Draft](https://www.w3.org/TR/2024/CRD-trace-context-2-20240328/)
+  defines the explicit Level 2 key grammar and random trace-ID flag.
+- [Google Cloud trace and log integration](https://cloud.google.com/trace/docs/trace-log-integration)
+  documents the bare trace ID as the preferred trace field format.
+- [Google Cloud Trace release notes](https://cloud.google.com/trace/docs/release-notes)
+  record when the bare trace ID became the preferred form while the full
+  project resource name remained supported.
+- [Google Cloud structured logging](https://cloud.google.com/logging/docs/structured-logging)
+  documents `severity`, `message`, `httpRequest`, and special trace fields.
+- [AWS X-Ray trace IDs](https://docs.aws.amazon.com/xray/latest/devguide/xray-api-sendingdata.html#xray-api-traceids)
+  document converting a W3C trace ID to `1-8hex-24hex` form.
+- [Azure Application Insights data model](https://learn.microsoft.com/en-us/azure/azure-monitor/app/data-model-complete)
+  defines `operation_Id` as the root-operation identifier and
+  `operation_ParentId` as the immediate-parent identifier.
+
+## License
+
+[MIT](LICENSE)

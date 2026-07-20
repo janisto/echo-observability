@@ -19,8 +19,8 @@ func main() {
 	e := echo.New()
 	e.Use(
 		obs.RequestContext(obs.RequestContextConfig{Logger: logger}),
-		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger}),
 		middleware.Recover(),
+		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger}),
 	)
 	e.GET("/health", func(c *echo.Context) error {
 		obs.Logger(c.Request().Context()).Info("health check")

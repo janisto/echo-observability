@@ -34,7 +34,8 @@ func TestParseTraceparentAcceptsValidBaseAndFutureVersions(t *testing.T) {
 		},
 		{name: "future version with printable lower boundary", value: futureBase + "- "},
 		{name: "future version with printable upper boundary", value: futureBase + "-~"},
-		{name: "maximum accepted length", value: maxLengthFutureTraceparent(t)},
+		{name: "long opaque extension", value: longFutureTraceparent()},
+		{name: "opaque obs text", value: futureBase + "-\x80\xff"},
 	}
 	for _, tt := range valid {
 		t.Run(tt.name, func(t *testing.T) {
@@ -63,9 +64,6 @@ func TestParseTraceparentAcceptsValidBaseAndFutureVersions(t *testing.T) {
 func TestParseTraceparentRejectsMalformedValues(t *testing.T) {
 	t.Parallel()
 	const base = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	maxLengthFuture := maxLengthFutureTraceparent(t)
-	multibyteOverLimit := "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-" + strings.Repeat("é", 228) + "x"
-
 	invalid := []struct {
 		name  string
 		value string
@@ -88,12 +86,6 @@ func TestParseTraceparentRejectsMalformedValues(t *testing.T) {
 			value: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01extra",
 		},
 		{name: "nonhex flags", value: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0g"},
-		{name: "over maximum length", value: maxLengthFuture + "a"},
-		{name: "over UTF-8 byte limit", value: multibyteOverLimit},
-		{
-			name:  "non-ASCII within length limit",
-			value: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-opaque-ümlaut",
-		},
 		{
 			name:  "control within length limit",
 			value: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-opaque\x1f",
@@ -226,7 +218,7 @@ func TestParseTracestateLevel1Matrix(t *testing.T) {
 		{name: "space before equals", rawValues: []string{"vendor =value"}},
 		{name: "empty key", rawValues: []string{"=value"}},
 		{name: "tab inside value", rawValues: []string{"vendor=\tvalue"}},
-		{name: "raw over limit", rawValues: []string{strings.Repeat(" ", 513)}},
+		{name: "long optional whitespace", rawValues: []string{strings.Repeat(" ", 513)}, valid: true},
 		{name: "duplicate key", rawValues: []string{"vendor=value1,vendor=value2"}},
 		{
 			name:      "empty member",
@@ -272,7 +264,7 @@ func TestParseTracestateLevel1Matrix(t *testing.T) {
 		{name: "32 members", rawValues: []string{tracestateMembers(32)}, want: tracestateMembers(32), valid: true},
 		{name: "33 members", rawValues: []string{tracestateMembers(33)}},
 		{name: "512 bytes", rawValues: []string{valid512}, want: valid512, valid: true},
-		{name: "513 bytes", rawValues: []string{valid512 + "w"}},
+		{name: "513 bytes", rawValues: []string{valid512 + "w"}, want: valid512 + "w", valid: true},
 		{name: "empty value", rawValues: []string{"vendor="}},
 	}
 	for _, tt := range tests {
@@ -344,14 +336,9 @@ func tracestateMembers(count int) string {
 	return strings.Join(members, ",")
 }
 
-func maxLengthFutureTraceparent(t *testing.T) string {
-	t.Helper()
+func longFutureTraceparent() string {
 	const futureBase = "fe-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
-	value := futureBase + "-" + strings.Repeat("a", maxTraceparentLen-traceparentLen-1)
-	if len(value) != maxTraceparentLen {
-		t.Fatalf("test fixture length = %d, want %d", len(value), maxTraceparentLen)
-	}
-	return value
+	return futureBase + "-" + strings.Repeat("a", 512)
 }
 
 func FuzzParseTraceparent(f *testing.F) {

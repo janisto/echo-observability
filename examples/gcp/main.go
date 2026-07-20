@@ -48,13 +48,13 @@ func newAppWithPreset(
 	e := echo.New()
 	e.Use(
 		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: preset}),
+		middleware.Recover(),
 		obs.AccessLogger(obs.AccessLoggerConfig{
 			Logger:            logger,
 			Preset:            preset,
 			GCPProfileVersion: profileVersion,
 			Now:               now,
 		}),
-		middleware.Recover(),
 	)
 	_, err := e.AddRoute(echo.Route{
 		Method:  http.MethodGet,

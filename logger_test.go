@@ -183,6 +183,75 @@ func TestGCPProfileVersionResolutionAndLoggerValidation(t *testing.T) {
 	}
 }
 
+func TestAWSAndAzureProfileVersionResolutionAndLoggerValidation(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name       string
+		preset     Preset
+		latest     string
+		resolve    func(Preset, string) (string, error)
+		config     func(string) LoggerConfig
+		wrongError string
+		crossError string
+	}{
+		{
+			name: "AWS", preset: PresetAWS, latest: string(AWSProfileVersionV0_1_0),
+			resolve: func(preset Preset, version string) (string, error) {
+				resolved, err := ResolveAWSProfileVersion(preset, AWSProfileVersion(version))
+				return string(resolved), err
+			},
+			config: func(version string) LoggerConfig {
+				return LoggerConfig{Preset: PresetAWS, AWSProfileVersion: AWSProfileVersion(version)}
+			},
+			wrongError: `observability: unsupported AWS profile version "0.2.0"`,
+			crossError: "observability: AWS profile version requires AWS preset",
+		},
+		{
+			name: "Azure", preset: PresetAzure, latest: string(AzureProfileVersionV0_1_0),
+			resolve: func(preset Preset, version string) (string, error) {
+				resolved, err := ResolveAzureProfileVersion(preset, AzureProfileVersion(version))
+				return string(resolved), err
+			},
+			config: func(version string) LoggerConfig {
+				return LoggerConfig{Preset: PresetAzure, AzureProfileVersion: AzureProfileVersion(version)}
+			},
+			wrongError: `observability: unsupported Azure profile version "0.2.0"`,
+			crossError: "observability: Azure profile version requires Azure preset",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if tt.latest != "0.1.0" {
+				t.Fatalf("latest literal = %q, want 0.1.0", tt.latest)
+			}
+			for _, version := range []string{"", "0.1.0"} {
+				resolved, err := tt.resolve(tt.preset, version)
+				if err != nil || resolved != "0.1.0" {
+					t.Fatalf("resolve(%q) = (%q, %v), want (0.1.0, nil)", version, resolved, err)
+				}
+				logger, err := NewLogger(tt.config(version))
+				if err != nil || logger == nil {
+					t.Fatalf("NewLogger(%q) = (%#v, %v), want logger, nil", version, logger, err)
+				}
+			}
+			if resolved, err := tt.resolve(
+				tt.preset,
+				"0.2.0",
+			); resolved != "" || err == nil ||
+				err.Error() != tt.wrongError {
+				t.Fatalf("noncurrent profile = (%q, %v), want empty and %q", resolved, err, tt.wrongError)
+			}
+			if resolved, err := tt.resolve(
+				PresetDefault,
+				"0.1.0",
+			); resolved != "" || err == nil ||
+				err.Error() != tt.crossError {
+				t.Fatalf("cross-preset profile = (%q, %v), want empty and %q", resolved, err, tt.crossError)
+			}
+		})
+	}
+}
+
 func TestNewLoggerWritesNamedLoggerField(t *testing.T) {
 	t.Parallel()
 	var buffer bytes.Buffer

@@ -74,6 +74,27 @@ func TestRequestContextUsesCustomValidatorAndDefaultsResponseHeader(t *testing.T
 	}
 }
 
+func TestRequestContextCustomValidatorMayBroadenNativeSafeRequestIDs(t *testing.T) {
+	t.Parallel()
+	for _, requestID := range []string{"id:42", strings.Repeat("a", 129), "native-\x81"} {
+		e := echo.New()
+		e.Use(RequestContext(RequestContextConfig{
+			ValidateRequestID: func(string) bool { return true },
+		}))
+		var got string
+		e.GET("/", func(c *echo.Context) error {
+			got = RequestID(c.Request().Context())
+			return c.NoContent(http.StatusNoContent)
+		})
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+		req.Header.Set(defaultRequestIDHeader, requestID)
+		e.ServeHTTP(httptest.NewRecorder(), req)
+		if got != requestID {
+			t.Fatalf("request ID = %q, want custom-admitted %q", got, requestID)
+		}
+	}
+}
+
 func TestRequestContextRequestIDLifecycle(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
@@ -184,17 +205,13 @@ func TestRequestContextTracestateBoundary(t *testing.T) {
 		req.Header.Set("Traceparent", traceparent)
 		req.Header.Set("Tracestate", tracestate)
 		e.ServeHTTP(httptest.NewRecorder(), req)
-		want := tracestate
-		if len(tracestate) > maxTracestateLen {
-			want = ""
-		}
-		if got != want {
+		if got != tracestate {
 			t.Fatalf(
 				"size %d: preserved input=%v, got length=%d, want length=%d",
 				len(tracestate),
 				got == tracestate,
 				len(got),
-				len(want),
+				len(tracestate),
 			)
 		}
 	}
@@ -331,6 +348,21 @@ func TestNewValidRequestIDUsesSafeDefaultFormatWhenCustomGenerationFails(t *test
 	decoded, err := hex.DecodeString(id)
 	if calls != 2 || err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
 		t.Errorf("calls=%d id=%q decode_error=%v", calls, id, err)
+	}
+}
+
+func TestNativeRequestIDBoundaryAllowsOnlyHTTPFieldText(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"\t", " ", "~", "\x80", "\xff"} {
+		if !nativeSafeRequestID(value) {
+			t.Fatalf("native-safe request ID boundary %q was rejected", value)
+		}
+	}
+	for _, value := range []string{"", "\x00", "\x1f", "\x7f"} {
+		if nativeSafeRequestID(value) {
+			t.Fatalf("unsafe request ID boundary %q was accepted", value)
+		}
 	}
 }
 
@@ -583,10 +615,11 @@ func TestHTTPRequestContextTraceAndTracestate(t *testing.T) {
 			wantTracestate: "vendor=value",
 		},
 		{
-			name:        "overlong state",
-			traceparent: traceparent,
-			tracestate:  strings.Repeat("a", maxTracestateLen+1),
-			wantValid:   true,
+			name:           "513 character state",
+			traceparent:    traceparent,
+			tracestate:     "a=" + strings.Repeat("v", 256) + ",b=" + strings.Repeat("w", 252),
+			wantValid:      true,
+			wantTracestate: "a=" + strings.Repeat("v", 256) + ",b=" + strings.Repeat("w", 252),
 		},
 		{name: "invalid trace", traceparent: "invalid", tracestate: "vendor=value"},
 	}
@@ -765,5 +798,33 @@ func TestRequestContextInstallsLoggerWithoutMutatingExistingMetadata(t *testing.
 	})
 	if metadata.Logger != nil {
 		t.Fatal("input metadata was mutated")
+	}
+}
+
+func TestRequestContextCompletesEmptyMetadataWithConfiguredLogger(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	metadata := &requestMetadata{}
+	ctx := contextWithRequestMetadata(context.Background(), metadata)
+	e := echo.New()
+	e.Use(RequestContext(RequestContextConfig{
+		Logger:       logger,
+		NewRequestID: func() string { return "generated-empty" },
+	}))
+	e.GET("/", func(c *echo.Context) error {
+		Logger(c.Request().Context()).Info("completed empty metadata")
+		return nil
+	})
+	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil))
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{
+		"message":        "completed empty metadata",
+		"request_id":     "generated-empty",
+		"correlation_id": "generated-empty",
+	})
+	if metadata.RequestID != "" || metadata.CorrelationID != "" || metadata.Logger != nil {
+		t.Fatalf("input metadata was mutated: %#v", metadata)
 	}
 }

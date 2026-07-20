@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/labstack/echo/v5"
+	echoMiddleware "github.com/labstack/echo/v5/middleware"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -703,6 +704,7 @@ func TestAccessLoggerRepresentativeRouteIdentityHasStableCardinality(t *testing.
 		{Method: http.MethodGet, Path: "/items/:item_id", Name: "get_item", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
 		{Method: http.MethodGet, Path: "/long/:" + longName, Name: "get_long", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
 		{Method: http.MethodGet, Path: "/extended/:0item-id", Name: "get_extended", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
+		{Method: http.MethodGet, Path: "/colon/:item:name", Name: "get\ncolon", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
 		{Method: http.MethodGet, Path: "/files/*", Name: "get_file", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
 	} {
 		if _, err := e.AddRoute(route); err != nil {
@@ -710,14 +712,14 @@ func TestAccessLoggerRepresentativeRouteIdentityHasStableCardinality(t *testing.
 		}
 	}
 	for _, target := range []string{
-		"/items/tenant-a", "/items/tenant-b", "/long/value", "/extended/value",
+		"/items/tenant-a", "/items/tenant-b", "/long/value", "/extended/value", "/colon/value",
 		"/files/tenant-a/one", "/files/tenant-b/two",
 	} {
 		e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil))
 	}
 	entries := decodeLogLines(t, buffer.String())
-	if len(entries) != 6 {
-		t.Fatalf("log line count = %d, want 6", len(entries))
+	if len(entries) != 7 {
+		t.Fatalf("log line count = %d, want 7", len(entries))
 	}
 	for _, entry := range entries[:2] {
 		assertFields(t, entry, map[string]any{"path_template": "/items/{item_id}", "operation_id": "get_item"})
@@ -728,33 +730,28 @@ func TestAccessLoggerRepresentativeRouteIdentityHasStableCardinality(t *testing.
 	assertFields(t, entries[3], map[string]any{
 		"path_template": "/extended/{0item-id}", "operation_id": "get_extended",
 	})
-	for _, entry := range entries[4:] {
+	assertFields(t, entries[4], map[string]any{
+		"path_template": "/colon/{item:name}", "operation_id": "get\ncolon",
+	})
+	for _, entry := range entries[5:] {
 		assertFields(t, entry, map[string]any{"path_template": "/files/{*path}", "operation_id": "get_file"})
 	}
 }
 
-func TestAccessMetadataStringsRejectEmptyDuplicateAndControlValues(t *testing.T) {
+func TestAccessMetadataStringsHonorNativeHeaderAndApplicationMetadataBoundaries(t *testing.T) {
 	t.Parallel()
 
-	if _, ok := singleValidHeaderValue([]string{"agent/1"}); !ok {
-		t.Fatal("one valid User-Agent was rejected")
+	if value, ok := singleValidUserAgent([]string{"agent\tcomment"}); !ok || value != "agent\tcomment" {
+		t.Fatalf("HTAB User-Agent = %q, %v; want preserved", value, ok)
 	}
-	for _, values := range [][]string{nil, {""}, {"agent/1", "agent/1"}, {"agent/1\nforged"}} {
-		if value, ok := singleValidHeaderValue(values); ok || value != "" {
-			t.Fatalf("singleValidHeaderValue(%q) = %q, %v; want empty, false", values, value, ok)
+	for _, value := range []string{" ", "~", "\x80", "\xff"} {
+		if got, ok := singleValidUserAgent([]string{value}); !ok || got != value {
+			t.Fatalf("valid User-Agent boundary %q = %q, %v", value, got, ok)
 		}
 	}
-	if validMetadataString("get_item\nforged") {
-		t.Fatal("operation ID containing a control character was accepted")
-	}
-	for _, value := range []string{"\x1f", "\x7f"} {
-		if validMetadataString(value) {
-			t.Fatalf("metadata control boundary %q was accepted", value)
-		}
-	}
-	for _, value := range []string{" ", "~"} {
-		if !validMetadataString(value) {
-			t.Fatalf("printable metadata boundary %q was rejected", value)
+	for _, value := range []string{"\x00", "\x1f", "\x7f"} {
+		if got, ok := singleValidUserAgent([]string{value}); ok || got != "" {
+			t.Fatalf("unsafe User-Agent boundary %q = %q, %v", value, got, ok)
 		}
 	}
 }
@@ -799,7 +796,7 @@ func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
 		{native: "/files/*", want: "/files/{*path}", ok: true},
 		{native: "*", want: "/{*path}", ok: true},
 		{native: "/items/:item_id?"},
-		{native: "/items/:item_id.:format"},
+		{native: "/items/:item_id.:format", want: "/items/{item_id.:format}", ok: true},
 		{native: "/files/*/suffix"},
 	} {
 		t.Run(test.native, func(t *testing.T) {
@@ -814,7 +811,7 @@ func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
 		})
 	}
 	for _, name := range []string{
-		"A", "_", "0item", "item-id", "item.name", strings.Repeat("a", 65),
+		"A", "_", "0item", "item-id", "item.name", "item name", "a:other", strings.Repeat("a", 65),
 	} {
 		t.Run("valid-name-"+name, func(t *testing.T) {
 			t.Parallel()
@@ -825,7 +822,7 @@ func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
 			}
 		})
 	}
-	for _, name := range []string{"", "{a", "a}", "a*", "a?", "a#", "a:other", "a\nforged"} {
+	for _, name := range []string{"", "{a", "a}", "a*", "a?", "a#", "a\nforged"} {
 		t.Run("invalid-name-"+name, func(t *testing.T) {
 			t.Parallel()
 			if got, ok := canonicalRouteTemplate("/items/:" + name); ok || got != "" {
@@ -957,6 +954,30 @@ func TestAccessLoggerLogsAndRethrowsPanic(t *testing.T) {
 	if _, ok := entry["status"]; ok {
 		t.Fatalf("uncommitted panic emitted inferred status: %#v", entry)
 	}
+}
+
+func TestRecoveryOutsideAccessLoggerPreservesPanicClassification(t *testing.T) {
+	t.Parallel()
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	e := echo.New()
+	e.Use(
+		echoMiddleware.RecoverWithConfig(echoMiddleware.RecoverConfig{DisablePrintStack: true}),
+		AccessLogger(AccessLoggerConfig{Logger: logger}),
+	)
+	e.GET("/panic", func(*echo.Context) error { panic("boom") })
+	recorder := httptest.NewRecorder()
+	e.ServeHTTP(
+		recorder,
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/panic", nil),
+	)
+	if recorder.Code != http.StatusInternalServerError {
+		t.Fatalf("wire status = %d, want %d", recorder.Code, http.StatusInternalServerError)
+	}
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{
+		"message": "request completed", "terminal_reason": "panic", "level": "ERROR",
+	})
 }
 
 func TestAccessLoggerPreservesCommittedStatusAndRethrowsPanic(t *testing.T) {
@@ -1639,6 +1660,30 @@ func TestAccessLoggerResolvesAndValidatesGCPProfileVersionAtConstruction(t *test
 			}()
 			AccessLogger(tt.config)
 		})
+	}
+}
+
+func TestAccessLoggerResolvesAWSAndAzureProfileVersionsAtConstruction(t *testing.T) {
+	t.Parallel()
+	awsLatest := normalizeAccessLoggerConfig(AccessLoggerConfig{Preset: PresetAWS})
+	awsPinned := normalizeAccessLoggerConfig(AccessLoggerConfig{
+		Preset: PresetAWS, AWSProfileVersion: AWSProfileVersionV0_1_0,
+	})
+	if awsLatest.AWSProfileVersion != AWSProfileVersionV0_1_0 ||
+		awsPinned.AWSProfileVersion != AWSProfileVersionV0_1_0 {
+		t.Fatalf("AWS profiles = %q/%q, want 0.1.0", awsLatest.AWSProfileVersion, awsPinned.AWSProfileVersion)
+	}
+	azureLatest := normalizeAccessLoggerConfig(AccessLoggerConfig{Preset: PresetAzure})
+	azurePinned := normalizeAccessLoggerConfig(AccessLoggerConfig{
+		Preset: PresetAzure, AzureProfileVersion: AzureProfileVersionV0_1_0,
+	})
+	if azureLatest.AzureProfileVersion != AzureProfileVersionV0_1_0 ||
+		azurePinned.AzureProfileVersion != AzureProfileVersionV0_1_0 {
+		t.Fatalf(
+			"Azure profiles = %q/%q, want 0.1.0",
+			azureLatest.AzureProfileVersion,
+			azurePinned.AzureProfileVersion,
+		)
 	}
 }
 

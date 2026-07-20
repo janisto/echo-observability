@@ -21,7 +21,8 @@ Every service follows the same shape:
 
 1. Create one logger with the selected preset.
 2. Install `RequestContext` before `AccessLogger` with the same logger and preset.
-3. Install recovery after `AccessLogger` when panics must be logged first.
+3. Install recovery before `AccessLogger` so access logging observes and
+   rethrows panics before recovery turns them into application responses.
 4. Use `obs.Logger(ctx)` in handlers and services.
 5. Add service-specific fields directly to application logs; they do not leak
    into the separate access record.
@@ -48,12 +49,12 @@ e.Use(
 		Logger: logger,
 		Preset: obs.PresetGCP,
 	}),
+	middleware.Recover(),
 	obs.AccessLogger(obs.AccessLoggerConfig{
 		Logger:            logger,
 		Preset:            obs.PresetGCP,
 		GCPProfileVersion: profileVersion,
 	}),
-	middleware.Recover(),
 )
 ```
 
@@ -104,7 +105,8 @@ Level 2 adds `trace_id_random`, derived from bit one of the preserved
 two-character `trace_flags`. Unsupported levels fail at middleware
 construction. Duplicate request-ID or `traceparent` field-lines are rejected
 as ambiguous, and `tracestate` is retained only after complete selected-level
-grammar, duplicate-key, 32-member, and 512-byte validation.
+grammar, duplicate-key, and 32-member validation. A valid value is not rejected
+merely because it exceeds the 512-character minimum propagation capacity.
 
 Raw path, direct peer IP, and user agent are disabled by default and have
 independent access-log opt-ins. GCP does not change those defaults. Captured
@@ -129,7 +131,8 @@ go run ./examples/aws
 The AWS preset keeps flat JSON. A valid W3C trace ID is also formatted as
 `xray_trace_id`, for example
 `1-4bf92f35-77b34da6a3ce929d0e0e4736`. The package does not create X-Ray
-segments or parse `X-Amzn-Trace-Id`.
+segments or parse `X-Amzn-Trace-Id`. The exact current profile is `0.1.0`;
+omission resolves to it, and `AWSProfileVersionV0_1_0` pins it.
 
 ## Azure
 
@@ -139,7 +142,8 @@ go run ./examples/azure
 
 The Azure preset maps valid W3C values to `operation_Id` and
 `operation_ParentId`. It does not initialize an Azure SDK or parse legacy
-`Request-Id` headers.
+`Request-Id` headers. The exact current profile is `0.1.0`; omission resolves
+to it, and `AzureProfileVersionV0_1_0` pins it.
 
 ## Mixed Echo And `net/http` Routes
 

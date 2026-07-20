@@ -16,7 +16,6 @@ const (
 	defaultRequestIDHeader   = echo.HeaderXRequestID
 	defaultTraceparentHeader = "traceparent"
 	defaultTracestateHeader  = "tracestate"
-	maxTracestateLen         = 512
 )
 
 var fallbackRequestIDCounter atomic.Uint64
@@ -257,7 +256,7 @@ func newValidRequestID(newRequestID func() string) string {
 }
 
 func validIncomingRequestID(value string, validate func(string) bool) (valid bool) {
-	if !DefaultValidateRequestID(value) {
+	if !nativeSafeRequestID(value) {
 		return false
 	}
 	defer func() {
@@ -266,6 +265,19 @@ func validIncomingRequestID(value string, validate func(string) bool) (valid boo
 		}
 	}()
 	return validate(value)
+}
+
+func nativeSafeRequestID(value string) bool {
+	if value == "" {
+		return false
+	}
+	for index := range len(value) {
+		character := value[index]
+		if (character < 0x20 && character != '\t') || character == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func callRequestIDGenerator(newRequestID func() string) (id string, valid bool) {
