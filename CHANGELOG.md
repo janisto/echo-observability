@@ -43,6 +43,8 @@ module path.
 - Renamed the remaining internal direct-peer field so v2 source no longer
   models the removed portable `remote_ip` name. The required GCP
   `httpRequest.remoteIp` output member is unchanged.
+- Documented LF-terminated NDJSON as the logging boundary and added focused
+  raw-writer coverage for independently parseable records.
 
 - **Breaking:** Omit raw path, direct peer IP, and user agent from access logs
   by default. Applications that need them must enable the matching options.
