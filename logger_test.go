@@ -73,9 +73,12 @@ func TestNewLoggerRejectsUnknownPreset(t *testing.T) {
 
 func TestGCPProfileVersionResolutionAndLoggerValidation(t *testing.T) {
 	t.Parallel()
+	if GCPProfileVersionV0_1_0 != GCPProfileVersion("0.1.0") {
+		t.Fatalf("GCPProfileVersionV0_1_0 = %q, want literal 0.1.0", GCPProfileVersionV0_1_0)
+	}
 	latest, err := ResolveGCPProfileVersion(PresetGCP, "")
-	if err != nil || latest != GCPProfileVersionV0_1_0 {
-		t.Fatalf("latest GCP profile = (%q, %v), want %q", latest, err, GCPProfileVersionV0_1_0)
+	if err != nil || latest != GCPProfileVersion("0.1.0") {
+		t.Fatalf("latest GCP profile = (%q, %v), want literal 0.1.0", latest, err)
 	}
 	pinned, err := ResolveGCPProfileVersion(PresetGCP, GCPProfileVersionV0_1_0)
 	if err != nil || pinned != GCPProfileVersionV0_1_0 {
@@ -128,11 +131,15 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 		{},
 		{
 			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
-			Flags: "01", Sampled: true, Level: TraceContextLevel1, Valid: true,
+			Version: "00", Flags: "01", Sampled: true, Level: TraceContextLevel1, Valid: true,
 		},
 		{
 			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
-			Flags: "03", Sampled: true, Random: true, Level: TraceContextLevel2, Valid: true,
+			Version: "00", Flags: "03", Sampled: true, Random: true, Level: TraceContextLevel2, Valid: true,
+		},
+		{
+			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
+			Version: "01", Flags: "03", Sampled: true, Level: TraceContextLevel2, Valid: true,
 		},
 	} {
 		var buffer bytes.Buffer
@@ -165,12 +172,12 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 				t.Fatalf("%s = %#v, want %#v; entry=%#v", key, entry[key], value, entry)
 			}
 		}
-		if trace.Level == TraceContextLevel2 {
+		if trace.Level == TraceContextLevel2 && trace.Version == "00" {
 			if entry["trace_id_random"] != trace.Random {
 				t.Fatalf("trace_id_random = %#v, want %#v; entry=%#v", entry["trace_id_random"], trace.Random, entry)
 			}
 		} else if _, ok := entry["trace_id_random"]; ok {
-			t.Fatalf("Level 1 emitted trace_id_random: %#v", entry)
+			t.Fatalf("trace without version 00 Level 2 semantics emitted trace_id_random: %#v", entry)
 		}
 	}
 }

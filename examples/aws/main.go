@@ -7,7 +7,7 @@ import (
 	"github.com/labstack/echo/v5/middleware"
 	"go.uber.org/zap"
 
-	"github.com/janisto/echo-observability"
+	"github.com/janisto/echo-observability/v2"
 )
 
 func main() {

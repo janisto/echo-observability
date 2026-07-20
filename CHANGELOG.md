@@ -7,6 +7,25 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+The changes in this section target `v2.0.0` under module path
+`github.com/janisto/echo-observability/v2`. They must not be tagged on the v1
+module path.
+
+### Migration from v1
+
+- Change imports and installation commands to
+  `github.com/janisto/echo-observability/v2`.
+- Enable `CapturePath`, `CapturePeerIP`, and `CaptureUserAgent` explicitly where
+  those privacy-sensitive fields are still required.
+- Rename consumers of `remote_ip` to `peer_ip`; the new field uses the direct
+  socket peer and ignores proxy-derived addresses.
+- Update route dimensions to canonical `{name}` and `{*path}` templates.
+- Update error and status queries to use authoritative committed status,
+  standardized `service_error`/`panic` terminal reasons, and unconditional
+  `ERROR` severity for abnormal completion.
+- Treat custom request-ID validators as caller-input narrowing only; generated
+  IDs always retain the package baseline grammar.
+
 ### Added
 
 - Add GCP profile `0.1.0` selection with newest-supported default resolution,
@@ -40,6 +59,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Fold every GCP severity into the portable five-level vocabulary, reject
   terminal or unknown status-callback levels, omit unavailable request paths,
   and emit only canonical unzoned IP address literals for direct peers.
+
+### Fixed
+
+- Preserve sampling while omitting the Level 2 random flag for unknown future
+  `traceparent` versions.
+- Lock the exported and default-resolved GCP profile identifier to the literal
+  `0.1.0` in native regression tests.
 
 ## [1.0.1] - 2026-07-17
 

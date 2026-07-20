@@ -9,7 +9,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/janisto/echo-observability"
+	"github.com/janisto/echo-observability/v2"
 )
 
 func main() {

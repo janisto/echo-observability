@@ -1,10 +1,10 @@
 # echo-observability
 
 [![Latest release](https://img.shields.io/github/v/release/janisto/echo-observability)](https://github.com/janisto/echo-observability/releases/latest)
-[![Go Reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/janisto/echo-observability)
+[![Go Reference](https://img.shields.io/badge/go.dev-reference-007d9c?logo=go&logoColor=white)](https://pkg.go.dev/github.com/janisto/echo-observability/v2)
 [![Go version](https://img.shields.io/github/go-mod/go-version/janisto/echo-observability)](https://github.com/janisto/echo-observability/blob/main/go.mod)
 [![CI](https://img.shields.io/github/actions/workflow/status/janisto/echo-observability/ci.yml?branch=main&label=CI)](https://github.com/janisto/echo-observability/actions/workflows/ci.yml)
-[![Socket Badge](https://badge.socket.dev/go/package/github.com/janisto/echo-observability)](https://socket.dev/go/package/github.com/janisto/echo-observability)
+[![Socket Badge](https://badge.socket.dev/go/package/github.com/janisto/echo-observability/v2)](https://socket.dev/go/package/github.com/janisto/echo-observability/v2)
 
 `echo-observability` provides request correlation, request-scoped Zap loggers,
 and structured Zap access logging middleware for
@@ -36,7 +36,7 @@ OpenTelemetry, or ship logs to a backend.
 
 ## Package scope
 
-The module path is `github.com/janisto/echo-observability`; the declared Go
+The module path is `github.com/janisto/echo-observability/v2`; the declared Go
 package name is `obs`.
 
 This is not official Echo middleware. It is a small, opinionated package for
@@ -67,14 +67,15 @@ endpoint exporters.
 - Echo v5.2.0 or newer within the Echo v5 line.
 - Zap.
 
-Starting with v1.0.0, exported APIs and documented structured log fields are
-compatibility contracts. Breaking changes are reserved for a future major
-version.
+The v1 API and log contract remains available at the unsuffixed module path.
+This checkout targets v2 because its privacy defaults and structured output are
+intentionally incompatible with v1. See the changelog migration section before
+upgrading.
 
 ## Install
 
 ```sh
-go get github.com/janisto/echo-observability
+go get github.com/janisto/echo-observability/v2
 ```
 
 ## Quick Start
@@ -94,7 +95,7 @@ import (
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
-	"github.com/janisto/echo-observability"
+	"github.com/janisto/echo-observability/v2"
 )
 
 func main() {
@@ -269,7 +270,7 @@ missing, but explicit installation of both middlewares is preferred. It emits:
 
 The request-scoped fields are `request_id`, `correlation_id`, and, for valid
 W3C trace context, `trace_id`, `parent_id`, `trace_flags`, and
-`trace_sampled`. Explicit Level 2 also adds `trace_id_random`.
+`trace_sampled`. Explicit Level 2 also adds `trace_id_random` for version `00`.
 
 Only a response committed before the handler returns supplies logged status.
 A returned error uses terminal reason `service_error`, level `ERROR`, and no
@@ -355,9 +356,9 @@ field-line is eligible. Multiple `tracestate` fields are combined in wire
 order and validated with the selected level's complete key/value grammar,
 unique keys, at most 32 members, and a 512-byte raw ceiling. Invalid
 `tracestate` is discarded without discarding a valid `traceparent`.
-Level 2 projects bit one of `trace_flags` as `trace_id_random`; Level 1
-preserves the two-character flags but does not assign that bit portable
-meaning.
+For version `00`, Level 2 projects bit one of `trace_flags` as
+`trace_id_random`. Level 1 and unknown higher versions preserve the
+two-character flags but do not assign that bit portable meaning.
 
 Provider-specific headers such as `X-Cloud-Trace-Context`,
 `X-Amzn-Trace-Id`, and Azure's legacy `Request-Id` are intentionally not
@@ -444,7 +445,8 @@ Request-scoped lines add:
 - `request_id`.
 - `correlation_id`.
 - `trace_id`, `parent_id`, `trace_flags`, and `trace_sampled` only for a valid
-  W3C trace; `trace_id_random` additionally in explicit Level 2 mode.
+  W3C trace; `trace_id_random` additionally for version `00` in explicit Level
+  2 mode.
 - Provider-specific trace fields selected by the configured preset.
 
 Access lines add:

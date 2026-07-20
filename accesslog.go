@@ -233,7 +233,7 @@ func requestMetadataFields(metadata *requestMetadata) []zap.Field {
 			zap.String("trace_flags", metadata.Trace.Flags),
 			zap.Bool("trace_sampled", metadata.Trace.Sampled),
 		)
-		if metadata.Trace.Level == TraceContextLevel2 {
+		if metadata.Trace.Level == TraceContextLevel2 && metadata.Trace.Version == "00" {
 			fields = append(fields, zap.Bool("trace_id_random", metadata.Trace.Random))
 		}
 	}
