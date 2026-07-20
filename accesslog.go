@@ -294,7 +294,7 @@ func accessLogFields(
 			URL:       path,
 			Status:    status,
 			UserAgent: userAgent,
-			RemoteIP:  peerIP,
+			PeerIP:    peerIP,
 			Latency:   duration,
 		}))
 	}
@@ -476,7 +476,7 @@ type gcpHTTPRequest struct {
 	URL       string
 	Status    int
 	UserAgent string
-	RemoteIP  string
+	PeerIP    string
 	Latency   time.Duration
 }
 
@@ -493,8 +493,8 @@ func (r gcpHTTPRequest) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
 	if r.UserAgent != "" {
 		encoder.AddString("userAgent", r.UserAgent)
 	}
-	if r.RemoteIP != "" {
-		encoder.AddString("remoteIp", r.RemoteIP)
+	if r.PeerIP != "" {
+		encoder.AddString("remoteIp", r.PeerIP)
 	}
 	encoder.AddString("latency", formatProtoDuration(r.Latency))
 	return nil
