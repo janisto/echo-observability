@@ -15,8 +15,9 @@ module path.
 
 - Change imports and installation commands to
   `github.com/janisto/echo-observability/v2`.
-- Enable `CapturePath`, `CapturePeerIP`, and `CaptureUserAgent` explicitly where
-  those privacy-sensitive fields are still required.
+- Enable `CapturePath`, `CapturePeerIP`, `CaptureUserAgent`, and
+  `CaptureError` explicitly where those privacy-sensitive fields are still
+  required. Error text can contain application or user data.
 - Rename consumers of `remote_ip` to `peer_ip`; the new field uses the direct
   socket peer and ignores proxy-derived addresses.
 - Update route dimensions to canonical `{name}` and `{*path}` templates.
@@ -32,8 +33,8 @@ module path.
 
 - Add GCP profile `0.1.0` selection with newest-supported default resolution,
   exact pinning, and effective-version introspection.
-- Add independent `CapturePath`, `CapturePeerIP`, and `CaptureUserAgent`
-  access-log opt-ins.
+- Add independent `CapturePath`, `CapturePeerIP`, `CaptureUserAgent`, and
+  `CaptureError` access-log opt-ins.
 - Add immutable W3C Trace Context Level 1/Level 2 selection, effective-level
   resolution, complete selected-level `tracestate` validation, and Level 2
   `trace_id_random` projection.
@@ -46,8 +47,9 @@ module path.
 - Documented LF-terminated NDJSON as the logging boundary and added focused
   raw-writer coverage for independently parseable records.
 
-- **Breaking:** Omit raw path, direct peer IP, and user agent from access logs
-  by default. Applications that need them must enable the matching options.
+- **Breaking:** Omit raw path, direct peer IP, user agent, and returned error
+  text from access logs by default. Applications that need them must enable
+  the matching options.
 - **Breaking:** Rename the opt-in direct-peer field from `remote_ip` to
   `peer_ip`; it now reads only `Request.RemoteAddr` and ignores Echo proxy IP
   extraction. Narrow GCP `httpRequest.requestUrl` to the query-free path.
@@ -69,6 +71,12 @@ module path.
   and emit only canonical unzoned IP address literals for direct peers.
 
 ### Fixed
+
+- Preserve framework-valid route parameter names, including extended and
+  longer names, reject non-ASCII or control-bearing `traceparent` fields, and
+  reject trace-level disagreement regardless of middleware order. Reject
+  unknown presets consistently and prevent access enrichment from replacing
+  Zap-owned caller and Level 2 trace fields.
 
 - Preserve sampling while omitting the Level 2 random flag for unknown future
   `traceparent` versions.

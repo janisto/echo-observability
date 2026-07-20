@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v5"
 	"go.uber.org/zap"
@@ -500,6 +502,66 @@ func TestHTTPRequestContextLifecycle(t *testing.T) {
 				t.Fatalf("NewRequestID calls = %d, want %d", generatedCalls, tt.wantGenerated)
 			}
 		})
+	}
+}
+
+type callerContextKey struct{}
+
+func TestRequestContextMiddlewarePreservesCallerValueCancellationAndDeadline(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Echo", func(t *testing.T) {
+		t.Parallel()
+		parent, deadline := canceledCallerContext(t)
+		e := echo.New()
+		e.Use(RequestContext(RequestContextConfig{}))
+		e.GET("/", func(c *echo.Context) error {
+			assertCallerContextPreserved(t, c.Request().Context(), deadline)
+			return c.NoContent(http.StatusNoContent)
+		})
+		e.ServeHTTP(
+			httptest.NewRecorder(),
+			httptest.NewRequestWithContext(parent, http.MethodGet, "/", nil),
+		)
+	})
+
+	t.Run("net/http", func(t *testing.T) {
+		t.Parallel()
+		parent, deadline := canceledCallerContext(t)
+		handler := HTTPRequestContext(HTTPRequestContextConfig{})(http.HandlerFunc(
+			func(_ http.ResponseWriter, request *http.Request) {
+				assertCallerContextPreserved(t, request.Context(), deadline)
+			},
+		))
+		handler.ServeHTTP(
+			httptest.NewRecorder(),
+			httptest.NewRequestWithContext(parent, http.MethodGet, "/http", nil),
+		)
+	})
+}
+
+func canceledCallerContext(t *testing.T) (context.Context, time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(time.Hour)
+	parent, cancel := context.WithDeadline(
+		context.WithValue(context.Background(), callerContextKey{}, "sentinel"),
+		deadline,
+	)
+	cancel()
+	return parent, deadline
+}
+
+func assertCallerContextPreserved(t *testing.T, ctx context.Context, deadline time.Time) {
+	t.Helper()
+	if got := ctx.Value(callerContextKey{}); got != "sentinel" {
+		t.Fatalf("caller context value = %#v, want sentinel", got)
+	}
+	gotDeadline, ok := ctx.Deadline()
+	if !ok || !gotDeadline.Equal(deadline) {
+		t.Fatalf("caller deadline = (%v, %v), want %v", gotDeadline, ok, deadline)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("caller cancellation = %v, want context.Canceled", ctx.Err())
 	}
 }
 

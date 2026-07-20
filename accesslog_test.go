@@ -24,6 +24,13 @@ type panickingWriter struct {
 	value any
 }
 
+type reservedInlineFields struct{}
+
+func (reservedInlineFields) MarshalLogObject(encoder zapcore.ObjectEncoder) error {
+	encoder.AddString("request_id", "inline-forged")
+	return nil
+}
+
 func (w panickingWriter) Write([]byte) (int, error) {
 	panic(w.value)
 }
@@ -691,25 +698,37 @@ func TestAccessLoggerRepresentativeRouteIdentityHasStableCardinality(t *testing.
 	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 	e := echo.New()
 	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	longName := strings.Repeat("a", 65)
 	for _, route := range []echo.Route{
 		{Method: http.MethodGet, Path: "/items/:item_id", Name: "get_item", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
+		{Method: http.MethodGet, Path: "/long/:" + longName, Name: "get_long", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
+		{Method: http.MethodGet, Path: "/extended/:0item-id", Name: "get_extended", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
 		{Method: http.MethodGet, Path: "/files/*", Name: "get_file", Handler: func(c *echo.Context) error { return c.NoContent(http.StatusOK) }},
 	} {
 		if _, err := e.AddRoute(route); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, target := range []string{"/items/tenant-a", "/items/tenant-b", "/files/tenant-a/one", "/files/tenant-b/two"} {
+	for _, target := range []string{
+		"/items/tenant-a", "/items/tenant-b", "/long/value", "/extended/value",
+		"/files/tenant-a/one", "/files/tenant-b/two",
+	} {
 		e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil))
 	}
 	entries := decodeLogLines(t, buffer.String())
-	if len(entries) != 4 {
-		t.Fatalf("log line count = %d, want 4", len(entries))
+	if len(entries) != 6 {
+		t.Fatalf("log line count = %d, want 6", len(entries))
 	}
 	for _, entry := range entries[:2] {
 		assertFields(t, entry, map[string]any{"path_template": "/items/{item_id}", "operation_id": "get_item"})
 	}
-	for _, entry := range entries[2:] {
+	assertFields(t, entries[2], map[string]any{
+		"path_template": "/long/{" + longName + "}", "operation_id": "get_long",
+	})
+	assertFields(t, entries[3], map[string]any{
+		"path_template": "/extended/{0item-id}", "operation_id": "get_extended",
+	})
+	for _, entry := range entries[4:] {
 		assertFields(t, entry, map[string]any{"path_template": "/files/{*path}", "operation_id": "get_file"})
 	}
 }
@@ -794,7 +813,9 @@ func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
 			}
 		})
 	}
-	for _, name := range []string{"A", "Z", "a", "z", "_", "a0", "a9", strings.Repeat("a", 64)} {
+	for _, name := range []string{
+		"A", "_", "0item", "item-id", "item.name", strings.Repeat("a", 65),
+	} {
 		t.Run("valid-name-"+name, func(t *testing.T) {
 			t.Parallel()
 			native := "/items/:" + name
@@ -804,11 +825,53 @@ func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
 			}
 		})
 	}
-	for _, name := range []string{"", "0a", "9a", "@a", "[a", "`a", "{a", "a.", "a:", strings.Repeat("a", 65)} {
+	for _, name := range []string{"", "{a", "a}", "a*", "a?", "a#", "a:other", "a\nforged"} {
 		t.Run("invalid-name-"+name, func(t *testing.T) {
 			t.Parallel()
 			if got, ok := canonicalRouteTemplate("/items/:" + name); ok || got != "" {
 				t.Fatalf("invalid parameter name %q produced (%q, %v)", name, got, ok)
+			}
+		})
+	}
+}
+
+func TestComposedMiddlewareRejectsTraceContextLevelMismatchInEitherOrder(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name         string
+		requestLevel TraceContextLevel
+		accessLevel  TraceContextLevel
+		requestOuter bool
+	}{
+		{name: "request outer", requestLevel: TraceContextLevel1, accessLevel: TraceContextLevel2, requestOuter: true},
+		{name: "access outer", requestLevel: TraceContextLevel1, accessLevel: TraceContextLevel2},
+		{name: "reverse levels request outer", requestLevel: TraceContextLevel2, accessLevel: TraceContextLevel1, requestOuter: true},
+		{name: "reverse levels access outer", requestLevel: TraceContextLevel2, accessLevel: TraceContextLevel1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := echo.New()
+			c := e.NewContext(
+				httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil),
+				httptest.NewRecorder(),
+			)
+			request := RequestContext(RequestContextConfig{TraceContextLevel: tt.requestLevel})
+			access := AccessLogger(AccessLoggerConfig{TraceContextLevel: tt.accessLevel})
+			terminal := func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) }
+			var handler echo.HandlerFunc
+			if tt.requestOuter {
+				handler = request(access(terminal))
+			} else {
+				handler = access(request(terminal))
+			}
+			defer func() {
+				if got := recover(); got != "trace context level mismatch between RequestContext and AccessLogger" {
+					t.Fatalf("mismatch panic = %v", got)
+				}
+			}()
+			if err := handler(c); err != nil {
+				t.Fatalf("composed middleware returned error instead of panicking: %v", err)
 			}
 		})
 	}
@@ -1247,8 +1310,9 @@ func TestAccessLoggerFiltersReservedFields(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 	reservedKeys := []string{
-		"timestamp", "level", "severity", "logger", "message", "error",
+		"timestamp", "level", "severity", "logger", "caller", "message", "error",
 		"request_id", "correlation_id", "trace_id", "parent_id", "trace_flags", "trace_sampled",
+		"trace_id_random",
 		"method", "path", "path_template", "operation_id", "status", "duration_ms",
 		"terminal_reason", "peer_ip", "remote_ip", "user_agent", "httpRequest",
 	}
@@ -1279,6 +1343,48 @@ func TestAccessLoggerFiltersReservedFields(t *testing.T) {
 	}
 	if count := strings.Count(line, `"tenant_id"`); count != 1 {
 		t.Fatalf("tenant_id count = %d, want 1: %s", count, line)
+	}
+}
+
+func TestAccessLoggerProtectsCallerAndRandomTraceFieldsFromExtraFields(t *testing.T) {
+	t.Parallel()
+
+	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-02"
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer, AddCaller: true})
+	e := echo.New()
+	e.Use(AccessLogger(AccessLoggerConfig{
+		Logger:            logger,
+		TraceContextLevel: TraceContextLevel2,
+		ExtraFields: func(*echo.Context) []zap.Field {
+			return []zap.Field{
+				zap.String("caller", "forged.go:1"),
+				zap.Bool("trace_id_random", false),
+				zap.Inline(reservedInlineFields{}),
+			}
+		},
+	}))
+	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	request.Header.Set("Traceparent", traceparent)
+	e.ServeHTTP(httptest.NewRecorder(), request)
+
+	line := strings.TrimSpace(buffer.String())
+	if got := strings.Count(line, `"caller"`); got != 1 {
+		t.Fatalf("caller key count = %d, want 1; line=%s", got, line)
+	}
+	if got := strings.Count(line, `"trace_id_random"`); got != 1 {
+		t.Fatalf("trace_id_random key count = %d, want 1; line=%s", got, line)
+	}
+	if strings.Contains(line, "forged.go:1") || strings.Contains(line, "inline-forged") {
+		t.Fatalf("forged inline or caller field leaked into access log: %s", line)
+	}
+	entry := decodeSingleLogLine(t, line)
+	if caller, ok := entry["caller"].(string); !ok || !strings.Contains(caller, "accesslog.go:") {
+		t.Fatalf("caller = %#v, want package access-log call site", entry["caller"])
+	}
+	if entry["trace_id_random"] != true {
+		t.Fatalf("trace_id_random = %#v, want true", entry["trace_id_random"])
 	}
 }
 

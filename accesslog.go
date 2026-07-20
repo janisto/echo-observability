@@ -359,12 +359,11 @@ func canonicalRouteTemplate(native string) (string, bool) {
 }
 
 func isRouteParameterName(name string) bool {
-	if name == "" || len(name) > 64 {
+	if name == "" {
 		return false
 	}
-	for index, char := range []byte(name) {
-		letter := char >= 'A' && char <= 'Z' || char >= 'a' && char <= 'z'
-		if !letter && char != '_' && (index == 0 || char < '0' || char > '9') {
+	for _, character := range name {
+		if character < 0x20 || character == 0x7f || strings.ContainsRune("/{}*?#:", character) {
 			return false
 		}
 	}
@@ -377,6 +376,9 @@ func appendExtraFields(fields, extra []zap.Field) []zap.Field {
 		seen[field.Key] = struct{}{}
 	}
 	for _, field := range extra {
+		if field.Type == zapcore.InlineMarshalerType {
+			continue
+		}
 		if isReservedLogField(field.Key) {
 			continue
 		}
@@ -391,7 +393,7 @@ func appendExtraFields(fields, extra []zap.Field) []zap.Field {
 
 func isReservedLogField(key string) bool {
 	switch key {
-	case "timestamp", "level", "severity", "logger", "message", "error",
+	case "timestamp", "level", "severity", "logger", "caller", "message", "error",
 		"request_id", "correlation_id", "trace_id", "parent_id", "trace_flags", "trace_sampled",
 		"trace_id_random",
 		"xray_trace_id", "operation_Id", "operation_ParentId", "method", "path", "path_template",

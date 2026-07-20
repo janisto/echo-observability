@@ -10,7 +10,6 @@ func TestParseTraceparentAcceptsValidBaseAndFutureVersions(t *testing.T) {
 	t.Parallel()
 
 	const futureBase = "fe-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00"
-	multibyteAtLimit := "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-" + strings.Repeat("é", 228)
 	valid := []struct {
 		name    string
 		value   string
@@ -33,8 +32,9 @@ func TestParseTraceparentAcceptsValidBaseAndFutureVersions(t *testing.T) {
 			name:  "future version with extension",
 			value: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra", sampled: true,
 		},
+		{name: "future version with printable lower boundary", value: futureBase + "- "},
+		{name: "future version with printable upper boundary", value: futureBase + "-~"},
 		{name: "maximum accepted length", value: maxLengthFutureTraceparent(t)},
-		{name: "UTF-8 byte limit", value: multibyteAtLimit, sampled: true},
 	}
 	for _, tt := range valid {
 		t.Run(tt.name, func(t *testing.T) {
@@ -90,6 +90,18 @@ func TestParseTraceparentRejectsMalformedValues(t *testing.T) {
 		{name: "nonhex flags", value: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0g"},
 		{name: "over maximum length", value: maxLengthFuture + "a"},
 		{name: "over UTF-8 byte limit", value: multibyteOverLimit},
+		{
+			name:  "non-ASCII within length limit",
+			value: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-opaque-ümlaut",
+		},
+		{
+			name:  "control within length limit",
+			value: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-opaque\x1f",
+		},
+		{
+			name:  "delete within length limit",
+			value: "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-opaque\x7f",
+		},
 	}
 	for _, tt := range invalid {
 		t.Run(tt.name, func(t *testing.T) {
