@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"encoding/hex"
+	"io"
 	"net/http"
 	"sync/atomic"
 	"unicode/utf8"
@@ -258,10 +259,8 @@ func metadataFromContext(ctx context.Context) *requestMetadata {
 }
 
 func newValidRequestID(newRequestID func() string) string {
-	for range 2 {
-		if id, ok := callRequestIDGenerator(newRequestID); ok {
-			return id
-		}
+	if id, ok := callRequestIDGenerator(newRequestID); ok {
+		return id
 	}
 	if id := fallbackRequestID(); DefaultValidateRequestID(id) {
 		return id
@@ -307,8 +306,12 @@ func callRequestIDGenerator(newRequestID func() string) (id string, valid bool) 
 }
 
 func defaultNewRequestID() string {
+	return randomRequestID(rand.Reader)
+}
+
+func randomRequestID(reader io.Reader) string {
 	var bytes [16]byte
-	if _, err := rand.Read(bytes[:]); err != nil {
+	if _, err := io.ReadFull(reader, bytes[:]); err != nil {
 		return fallbackRequestID()
 	}
 	return hex.EncodeToString(bytes[:])

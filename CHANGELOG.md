@@ -71,17 +71,26 @@ module path.
 - Contain panics from the access clock, status mapper, enrichment callback, and
   writer without changing the response; keep the first repeated custom field
   so package-controlled JSON contains no duplicate member names.
-- **Breaking:** Canonicalize Echo `:name` and terminal `*` route metadata to
-  portable `{name}` and `{*path}` templates; omit ambiguous native forms.
+- **Breaking:** Canonicalize simple Echo `:name` and terminal `*` route metadata
+  to portable `{name}` and `{*path}` templates; preserve richer nonempty matched
+  templates in Echo's authoritative native form.
 - Fold every GCP severity into the portable five-level vocabulary, reject
   terminal or unknown status-callback levels, omit unavailable request paths,
   and emit only canonical unzoned IP address literals for direct peers.
 
 ### Fixed
 
-- Prevent direct application Zap fields on package-created loggers from
-  overriding or duplicating reserved request, access, envelope, and provider
-  fields in raw NDJSON without replacing external Zap core admission behavior.
+- Protect only exact record-owned top-level fields in raw NDJSON, while
+  preserving access-only application fields, exact aliases owned only by an
+  inactive provider profile, other non-owned provider-looking keys, application
+  namespaces, and reserved-looking fields nested with `zap.Namespace`.
+- Preserve the selected provider preset through `HTTPRequestContext`, reject a
+  mismatched preset whenever existing request metadata is reused, and call a
+  configured request-ID generator once before using the package fallback.
+- Preserve framework-exposed escaped request paths, including asterisk-form
+  paths, without package-invented percent-encoding validation; keep the default
+  request-ID entropy path on successful reads; and align repository metadata
+  with the `/v2` module identity.
 - Emit GCP `httpRequest.latency` with canonical ProtoJSON fractional widths:
   0, 3, 6, or 9 digits according to the required precision.
 - Preserve framework-valid route parameter names, including colon-bearing and

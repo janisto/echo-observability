@@ -76,8 +76,8 @@ body:
     id: package-version
     attributes:
       label: Affected echo-observability version or commit
-      description: Paste the output of `go list -m github.com/janisto/echo-observability`, or provide the exact commit ID for an unreleased revision.
-      placeholder: "Example: github.com/janisto/echo-observability v0.1.0"
+      description: Paste the output of `go list -m github.com/janisto/echo-observability/v2`, or provide the exact commit ID for an unreleased revision.
+      placeholder: "Example: github.com/janisto/echo-observability/v2 v2.0.0"
     validations:
       required: true
 

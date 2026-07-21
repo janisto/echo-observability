@@ -63,6 +63,73 @@ func TestNewLoggerPresets(t *testing.T) {
 	}
 }
 
+func TestApplicationLoggerProtectsOnlyActiveProviderAliases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		preset Preset
+		owned  []string
+	}{
+		{name: "default", preset: PresetDefault},
+		{
+			name: "gcp", preset: PresetGCP,
+			owned: []string{"logging.googleapis.com/trace", "logging.googleapis.com/trace_sampled"},
+		},
+		{name: "aws", preset: PresetAWS, owned: []string{"xray_trace_id"}},
+		{name: "azure", preset: PresetAzure, owned: []string{"operation_Id", "operation_ParentId"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var buffer bytes.Buffer
+			logger, err := NewLogger(LoggerConfig{Preset: tt.preset, Writer: &buffer})
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.Info(
+				"provider aliases",
+				zap.String("level", "application-level"),
+				zap.String("severity", "application-severity"),
+				zap.String("logging.googleapis.com/trace", "application-gcp-trace"),
+				zap.Bool("logging.googleapis.com/trace_sampled", false),
+				zap.String("xray_trace_id", "application-xray"),
+				zap.String("operation_Id", "application-azure-operation"),
+				zap.String("operation_ParentId", "application-azure-parent"),
+				zap.String("httpRequest", "application-http-request"),
+			)
+
+			entry := decodeSingleLogLine(t, buffer.String())
+			want := map[string]any{
+				"logging.googleapis.com/trace":         "application-gcp-trace",
+				"logging.googleapis.com/trace_sampled": false,
+				"xray_trace_id":                        "application-xray",
+				"operation_Id":                         "application-azure-operation",
+				"operation_ParentId":                   "application-azure-parent",
+			}
+			for _, key := range tt.owned {
+				delete(want, key)
+				if _, present := entry[key]; present {
+					t.Fatalf("active %s alias %s was not protected: %#v", tt.name, key, entry)
+				}
+			}
+			assertFields(t, entry, want)
+			if tt.preset == PresetGCP {
+				assertFields(t, entry, map[string]any{
+					"severity": "INFO", "level": "application-level",
+				})
+			} else {
+				assertFields(t, entry, map[string]any{
+					"level": "INFO", "severity": "application-severity",
+				})
+			}
+			if entry["httpRequest"] != "application-http-request" {
+				t.Fatalf("application access-only field was dropped: %#v", entry)
+			}
+		})
+	}
+}
+
 func TestNewLoggerWritesLFTerminatedNDJSONRecords(t *testing.T) {
 	t.Parallel()
 

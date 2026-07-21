@@ -346,7 +346,7 @@ func TestNewValidRequestIDUsesSafeDefaultFormatWhenCustomGenerationFails(t *test
 		return "invalid value"
 	})
 	decoded, err := hex.DecodeString(id)
-	if calls != 2 || err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
+	if calls != 1 || err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
 		t.Errorf("calls=%d id=%q decode_error=%v", calls, id, err)
 	}
 }
@@ -449,6 +449,21 @@ func TestDefaultNewRequestIDProducesUniqueLowercase128BitValues(t *testing.T) {
 			t.Fatalf("generated duplicate request ID %q", id)
 		}
 		seen[id] = struct{}{}
+	}
+}
+
+func TestRandomRequestIDUsesProvidedEntropyAndFallsBackOnReadFailure(t *testing.T) {
+	t.Parallel()
+
+	want := strings.Repeat("ab", 16)
+	if got := randomRequestID(bytes.NewReader(bytes.Repeat([]byte{0xab}, 16))); got != want {
+		t.Fatalf("randomRequestID(success) = %q, want %q", got, want)
+	}
+
+	fallback := randomRequestID(strings.NewReader(""))
+	decoded, err := hex.DecodeString(fallback)
+	if err != nil || len(decoded) != 16 || fallback == want {
+		t.Fatalf("randomRequestID(read failure) = %q, decode_error=%v", fallback, err)
 	}
 }
 
@@ -561,31 +576,45 @@ func TestRequestContextMiddlewarePreservesCallerValueCancellationAndDeadline(t *
 
 	t.Run("Echo", func(t *testing.T) {
 		t.Parallel()
+		var buffer bytes.Buffer
+		logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 		parent, deadline := canceledCallerContext(t)
 		e := echo.New()
-		e.Use(RequestContext(RequestContextConfig{}))
+		e.Use(RequestContext(RequestContextConfig{Logger: logger}))
 		e.GET("/", func(c *echo.Context) error {
 			assertCallerContextPreserved(t, c.Request().Context(), deadline)
+			Logger(c.Request().Context()).Info("preserved Echo context")
 			return c.NoContent(http.StatusNoContent)
 		})
+		request := httptest.NewRequestWithContext(parent, http.MethodGet, "/", nil)
+		request.Header.Set(defaultRequestIDHeader, "req-preserved-echo")
 		e.ServeHTTP(
 			httptest.NewRecorder(),
-			httptest.NewRequestWithContext(parent, http.MethodGet, "/", nil),
+			request,
 		)
+		entry := decodeSingleLogLine(t, buffer.String())
+		assertFields(t, entry, map[string]any{"request_id": "req-preserved-echo"})
 	})
 
 	t.Run("net/http", func(t *testing.T) {
 		t.Parallel()
+		var buffer bytes.Buffer
+		logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 		parent, deadline := canceledCallerContext(t)
-		handler := HTTPRequestContext(HTTPRequestContextConfig{})(http.HandlerFunc(
+		handler := HTTPRequestContext(HTTPRequestContextConfig{Logger: logger})(http.HandlerFunc(
 			func(_ http.ResponseWriter, request *http.Request) {
 				assertCallerContextPreserved(t, request.Context(), deadline)
+				Logger(request.Context()).Info("preserved HTTP context")
 			},
 		))
+		request := httptest.NewRequestWithContext(parent, http.MethodGet, "/http", nil)
+		request.Header.Set(defaultRequestIDHeader, "req-preserved-http")
 		handler.ServeHTTP(
 			httptest.NewRecorder(),
-			httptest.NewRequestWithContext(parent, http.MethodGet, "/http", nil),
+			request,
 		)
+		entry := decodeSingleLogLine(t, buffer.String())
+		assertFields(t, entry, map[string]any{"request_id": "req-preserved-http"})
 	})
 }
 
@@ -710,6 +739,59 @@ func TestHTTPRequestContextInstallsProviderLogger(t *testing.T) {
 		"severity": "INFO", "request_id": "req-http", "correlation_id": "4bf92f3577b34da6a3ce929d0e0e4736",
 		"logging.googleapis.com/trace": "4bf92f3577b34da6a3ce929d0e0e4736",
 	})
+}
+
+func TestHTTPRequestContextPreservesPresetThroughEchoComposition(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Preset: PresetGCP, Writer: &buffer})
+	e := echo.New()
+	e.Use(RequestContext(RequestContextConfig{Logger: logger, Preset: PresetGCP}))
+	handlerCalled := false
+	e.GET("/preset", func(c *echo.Context) error {
+		handlerCalled = true
+		Logger(c.Request().Context()).Info("matching preset handler")
+		return c.NoContent(http.StatusNoContent)
+	})
+	handler := HTTPRequestContext(HTTPRequestContextConfig{
+		Logger: logger,
+		Preset: PresetGCP,
+	})(e)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/preset", nil)
+	request.Header.Set(defaultRequestIDHeader, "req-preset-integration")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if !handlerCalled || response.Code != http.StatusNoContent {
+		t.Fatalf("matching preset composition: handler_called=%v status=%d", handlerCalled, response.Code)
+	}
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{
+		"severity": "INFO", "request_id": "req-preset-integration",
+	})
+}
+
+func TestHTTPRequestContextRejectsPresetMismatchWhenReusingMetadata(t *testing.T) {
+	t.Parallel()
+
+	handler := HTTPRequestContext(HTTPRequestContextConfig{Preset: PresetGCP})(
+		HTTPRequestContext(HTTPRequestContextConfig{Preset: PresetAWS})(
+			http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Fatal("mismatched nested middleware reached handler")
+			}),
+		),
+	)
+	defer func() {
+		if got := recover(); got != "provider preset mismatch between RequestContext and AccessLogger" {
+			t.Fatalf("preset mismatch panic = %v", got)
+		}
+	}()
+	handler.ServeHTTP(
+		httptest.NewRecorder(),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil),
+	)
 }
 
 func TestHTTPRequestContextMetadataReuseAndImmutability(t *testing.T) {

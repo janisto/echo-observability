@@ -73,7 +73,7 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 						fields = append(fields, zap.Error(err))
 					}
 					if cfg.ExtraFields != nil {
-						fields = appendExtraFields(fields, safeExtraFields(cfg.ExtraFields, c))
+						fields = appendExtraFields(fields, safeExtraFields(cfg.ExtraFields, c), cfg.Preset)
 					}
 					entry.Write(fields...)
 				}
@@ -214,7 +214,7 @@ func loggerWithMetadata(
 	logger = logger.With(requestMetadataFields(metadata)...)
 	if metadata == nil {
 		if guarded {
-			return guardApplicationLogger(logger)
+			return guardApplicationLogger(logger, preset)
 		}
 		return logger
 	}
@@ -227,7 +227,7 @@ func loggerWithMetadata(
 		logger = logger.With(azureTraceFields(metadata.Trace)...)
 	}
 	if guarded {
-		return guardApplicationLogger(logger)
+		return guardApplicationLogger(logger, preset)
 	}
 	return logger
 }
@@ -339,11 +339,14 @@ func isExplicitRouteName(name, method, path string) bool {
 }
 
 func canonicalRouteTemplate(native string) (string, bool) {
+	if native == "" {
+		return "", false
+	}
 	if native == "*" {
 		return "/{*path}", true
 	}
-	if !strings.HasPrefix(native, "/") || strings.ContainsAny(native, "?#") {
-		return "", false
+	if !strings.HasPrefix(native, "/") {
+		return native, true
 	}
 	segments := strings.Split(strings.TrimPrefix(native, "/"), "/")
 	canonical := make([]string, 0, len(segments))
@@ -351,17 +354,17 @@ func canonicalRouteTemplate(native string) (string, bool) {
 		switch {
 		case segment == "*":
 			if index != len(segments)-1 {
-				return "", false
+				return native, true
 			}
 			canonical = append(canonical, "{*path}")
 		case strings.HasPrefix(segment, ":"):
 			name := strings.TrimPrefix(segment, ":")
-			if !isRouteParameterName(name) {
-				return "", false
+			if name == "" || strings.ContainsAny(name, ":*{}?#") {
+				return native, true
 			}
 			canonical = append(canonical, "{"+name+"}")
 		case strings.ContainsAny(segment, ":*{}"):
-			return "", false
+			return native, true
 		default:
 			canonical = append(canonical, segment)
 		}
@@ -369,31 +372,29 @@ func canonicalRouteTemplate(native string) (string, bool) {
 	return "/" + strings.Join(canonical, "/"), true
 }
 
-func isRouteParameterName(name string) bool {
-	if name == "" {
-		return false
-	}
-	for _, character := range name {
-		if character < 0x20 || character == 0x7f || strings.ContainsRune("/{}*?#", character) {
-			return false
-		}
-	}
-	return true
-}
-
-func appendExtraFields(fields, extra []zap.Field) []zap.Field {
+func appendExtraFields(fields, extra []zap.Field, preset Preset) []zap.Field {
 	seen := make(map[string]struct{})
 	for _, field := range fields {
 		seen[field.Key] = struct{}{}
 	}
+	nested := false
 	for _, field := range extra {
 		if field.Type == zapcore.InlineMarshalerType {
 			continue
 		}
-		if isReservedLogField(field.Key) {
+		if field.Type == zapcore.NamespaceType {
+			if _, exists := seen[field.Key]; exists || !nested && isReservedLogField(field.Key, preset) {
+				break
+			}
+			fields = append(fields, field)
+			seen = make(map[string]struct{})
+			nested = true
 			continue
 		}
 		if _, exists := seen[field.Key]; exists {
+			continue
+		}
+		if !nested && isReservedLogField(field.Key, preset) {
 			continue
 		}
 		seen[field.Key] = struct{}{}
@@ -402,22 +403,25 @@ func appendExtraFields(fields, extra []zap.Field) []zap.Field {
 	return fields
 }
 
-func isReservedLogField(key string) bool {
-	if strings.HasPrefix(key, "logging.googleapis.com/") ||
-		strings.HasPrefix(key, "obs.") ||
-		strings.HasPrefix(key, "_obs_") {
-		return true
-	}
+func isReservedLogField(key string, preset Preset) bool {
 	switch key {
-	case "timestamp", "level", "severity", "logger", "caller", "stacktrace", "message", "error",
+	case "timestamp", "logger", "caller", "stacktrace", "message", "error",
 		"request_id", "correlation_id", "trace_id", "parent_id", "trace_flags", "trace_sampled",
 		"trace_id_random",
-		"xray_trace_id", "operation_Id", "operation_ParentId", "method", "path", "path_template",
-		"operation_id", "status", "duration_ms", "terminal_reason", "peer_ip", "remote_ip", "user_agent", "httpRequest",
-		"logging.googleapis.com/trace", "logging.googleapis.com/trace_sampled", "logging.googleapis.com/spanId":
+		"method", "path", "path_template", "operation_id", "status", "duration_ms", "terminal_reason",
+		"peer_ip", "user_agent":
 		return true
+	}
+	switch preset {
+	case PresetGCP:
+		return key == "severity" || key == "logging.googleapis.com/trace" ||
+			key == "logging.googleapis.com/trace_sampled" || key == "httpRequest"
+	case PresetAWS:
+		return key == "level" || key == "xray_trace_id"
+	case PresetAzure:
+		return key == "level" || key == "operation_Id" || key == "operation_ParentId"
 	default:
-		return false
+		return key == "level"
 	}
 }
 
@@ -425,14 +429,7 @@ func requestPath(req *http.Request) string {
 	if req == nil || req.URL == nil || req.URL.Path == "" {
 		return ""
 	}
-	path := req.URL.EscapedPath()
-	if req.URL.RawPath != "" && path != req.URL.RawPath {
-		return ""
-	}
-	if !strings.HasPrefix(path, "/") || strings.Contains(path, "#") {
-		return ""
-	}
-	return path
+	return req.URL.EscapedPath()
 }
 
 func directPeerIP(remoteAddr string) string {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -134,7 +135,11 @@ func TestApplicationLoggerDropsReservedFieldsWithoutChangingAccessRecord(t *test
 			zap.Int("status", 599),
 			zap.String("message", "spoofed-message"),
 			zap.String("logging.googleapis.com/future", "spoofed-provider"),
+			zap.Any("logging.googleapis.com/labels", map[string]string{"component": "worker"}),
 			zap.Bool("obs.internal", true),
+			zap.Bool("_obs_debug", true),
+			zap.String("remote_ip", "application-peer"),
+			zap.String("logging.googleapis.com/spanId", "application-span"),
 			zap.String("error", "controlled application error"),
 			zap.String("tenant_id", "tenant-1"),
 		)
@@ -160,20 +165,36 @@ func TestApplicationLoggerDropsReservedFieldsWithoutChangingAccessRecord(t *test
 			t.Fatalf("%s key count = %d, want 1; line=%s", key, count, applicationLine)
 		}
 	}
-	for _, key := range []string{"method", "status", "logging.googleapis.com/future", "obs.internal"} {
-		if count := strings.Count(applicationLine, `"`+key+`"`); count != 0 {
-			t.Fatalf("%s key count = %d, want 0; line=%s", key, count, applicationLine)
+	for _, key := range []string{
+		"method", "status", "logging.googleapis.com/future", "logging.googleapis.com/labels",
+		"obs.internal", "_obs_debug",
+		"remote_ip", "logging.googleapis.com/spanId",
+	} {
+		if count := strings.Count(applicationLine, `"`+key+`"`); count != 1 {
+			t.Fatalf("%s key count = %d, want 1; line=%s", key, count, applicationLine)
 		}
 	}
 	application := decodeSingleLogLine(t, applicationLine)
 	assertFields(t, application, map[string]any{
-		"message":      "guarded application event",
-		"request_id":   "canonical-request",
-		"trace_id":     traceID,
-		"operation_Id": traceID,
-		"error":        "controlled application error",
-		"tenant_id":    "tenant-1",
+		"message":                       "guarded application event",
+		"request_id":                    "canonical-request",
+		"trace_id":                      traceID,
+		"operation_Id":                  traceID,
+		"method":                        "DELETE",
+		"status":                        float64(599),
+		"logging.googleapis.com/future": "spoofed-provider",
+		"obs.internal":                  true,
+		"_obs_debug":                    true,
+		"remote_ip":                     "application-peer",
+		"logging.googleapis.com/spanId": "application-span",
+		"error":                         "controlled application error",
+		"tenant_id":                     "tenant-1",
 	})
+	applicationLabels, ok := application["logging.googleapis.com/labels"].(map[string]any)
+	if !ok {
+		t.Fatalf("application labels object missing: %#v", application)
+	}
+	assertFields(t, applicationLabels, map[string]any{"component": "worker"})
 
 	access := decodeSingleLogLine(t, rawLines[1])
 	assertFields(t, access, map[string]any{
@@ -182,6 +203,49 @@ func TestApplicationLoggerDropsReservedFieldsWithoutChangingAccessRecord(t *test
 		"status":     float64(http.StatusNoContent),
 		"request_id": "canonical-request",
 	})
+}
+
+func TestApplicationLoggerPreservesNestedReservedLookingFieldsAcrossWith(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	e := echo.New()
+	e.Use(RequestContext(RequestContextConfig{Logger: logger}))
+	e.GET("/nested", func(c *echo.Context) error {
+		Logger(c.Request().Context()).With(zap.Namespace("job")).Info(
+			"nested application event",
+			zap.String("status", "running"),
+			zap.String("method", "worker"),
+			zap.String("request_id", "nested-request"),
+		)
+		Logger(c.Request().Context()).Info(
+			"protected namespace",
+			zap.Namespace("request_id"),
+			zap.String("forged", "must-not-be-hoisted"),
+		)
+		return c.NoContent(http.StatusNoContent)
+	})
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/nested", nil)
+	request.Header.Set(defaultRequestIDHeader, "canonical-request")
+	e.ServeHTTP(httptest.NewRecorder(), request)
+
+	entries := decodeLogLines(t, buffer.String())
+	if len(entries) != 2 {
+		t.Fatalf("log line count = %d, want 2; entries=%#v", len(entries), entries)
+	}
+	job, ok := entries[0]["job"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested job object missing: %#v", entries[0])
+	}
+	assertFields(t, job, map[string]any{
+		"status": "running", "method": "worker", "request_id": "nested-request",
+	})
+	assertFields(t, entries[0], map[string]any{"request_id": "canonical-request"})
+	assertFields(t, entries[1], map[string]any{"request_id": "canonical-request"})
+	if _, present := entries[1]["forged"]; present {
+		t.Fatalf("field after protected namespace was hoisted: %#v", entries[1])
+	}
 }
 
 func TestAccessLoggerPreservesExtensionMethodCaseThroughEchoRouteAndWriter(t *testing.T) {
@@ -849,7 +913,7 @@ func TestAccessLoggerRepresentativeRouteIdentityHasStableCardinality(t *testing.
 		"path_template": "/extended/{0item-id}", "operation_id": "get_extended",
 	})
 	assertFields(t, entries[4], map[string]any{
-		"path_template": "/colon/{item:name}", "operation_id": "get\ncolon",
+		"path_template": "/colon/:item:name", "operation_id": "get\ncolon",
 	})
 	for _, entry := range entries[5:] {
 		assertFields(t, entry, map[string]any{"path_template": "/files/{*path}", "operation_id": "get_file"})
@@ -945,9 +1009,10 @@ func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
 		{native: "/items/:item_id", want: "/items/{item_id}", ok: true},
 		{native: "/files/*", want: "/files/{*path}", ok: true},
 		{native: "*", want: "/{*path}", ok: true},
-		{native: "/items/:item_id?"},
-		{native: "/items/:item_id.:format", want: "/items/{item_id.:format}", ok: true},
-		{native: "/files/*/suffix"},
+		{native: "/items/:item_id?", want: "/items/:item_id?", ok: true},
+		{native: "/items/:item_id#", want: "/items/:item_id#", ok: true},
+		{native: "/items/:item_id.:format", want: "/items/:item_id.:format", ok: true},
+		{native: "/files/*/suffix", want: "/files/*/suffix", ok: true},
 	} {
 		t.Run(test.native, func(t *testing.T) {
 			t.Parallel()
@@ -961,7 +1026,7 @@ func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
 		})
 	}
 	for _, name := range []string{
-		"A", "_", "0item", "item-id", "item.name", "item name", "a:other", strings.Repeat("a", 65),
+		"A", "_", "0item", "item-id", "item.name", "item name", strings.Repeat("a", 65),
 	} {
 		t.Run("valid-name-"+name, func(t *testing.T) {
 			t.Parallel()
@@ -972,13 +1037,101 @@ func TestCanonicalRouteTemplateCurrentEchoForms(t *testing.T) {
 			}
 		})
 	}
-	for _, name := range []string{"", "{a", "a}", "a*", "a?", "a#", "a\nforged"} {
-		t.Run("invalid-name-"+name, func(t *testing.T) {
-			t.Parallel()
-			if got, ok := canonicalRouteTemplate("/items/:" + name); ok || got != "" {
-				t.Fatalf("invalid parameter name %q produced (%q, %v)", name, got, ok)
-			}
+	if got, ok := canonicalRouteTemplate(""); ok || got != "" {
+		t.Fatalf("empty route template produced (%q, %v)", got, ok)
+	}
+}
+
+func TestAccessLoggerPreservesMatchedEchoRouteSyntaxOutsideSimplePlaceholders(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	e := echo.New()
+	e.Use(AccessLogger(AccessLoggerConfig{Logger: logger}))
+	for _, route := range []echo.Route{
+		{
+			Method: http.MethodGet, Path: "/question/:item?", Name: "question-param",
+			Handler: func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) },
+		},
+		{
+			Method: http.MethodGet, Path: "/hash/:item#", Name: "hash-param",
+			Handler: func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) },
+		},
+		{
+			Method: http.MethodGet, Path: "/reports/report-:year", Name: "composite-param",
+			Handler: func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) },
+		},
+	} {
+		if _, err := e.AddRoute(route); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, target := range []string{
+		"/question/value", "/hash/value", "/reports/report-2026", "/reports/report-2027",
+	} {
+		response := httptest.NewRecorder()
+		e.ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, target, nil))
+		if response.Code != http.StatusNoContent {
+			t.Fatalf("GET %s status = %d, want 204", target, response.Code)
+		}
+	}
+	entries := decodeLogLines(t, buffer.String())
+	if len(entries) != 4 {
+		t.Fatalf("log line count = %d, want 4; entries=%#v", len(entries), entries)
+	}
+	assertFields(t, entries[0], map[string]any{
+		"path_template": "/question/:item?", "operation_id": "question-param",
+	})
+	assertFields(t, entries[1], map[string]any{
+		"path_template": "/hash/:item#", "operation_id": "hash-param",
+	})
+	for _, entry := range entries[2:] {
+		assertFields(t, entry, map[string]any{
+			"path_template": "/reports/report-:year", "operation_id": "composite-param",
 		})
+	}
+}
+
+func TestEchoRouteLanguageRequiresOptionalMarkerAndSupportsPrefixComposite(t *testing.T) {
+	t.Parallel()
+
+	e := echo.New()
+	handler := func(c *echo.Context) error { return c.NoContent(http.StatusNoContent) }
+	optional, err := e.AddRoute(echo.Route{
+		Method: http.MethodGet, Path: "/items/:item?", Handler: handler,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	composite, err := e.AddRoute(echo.Route{
+		Method: http.MethodGet, Path: "/reports/report-:year", Handler: handler,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !slices.Equal(optional.Parameters, []string{"item?"}) {
+		t.Fatalf("optional-marker parameters = %#v, want [item?]", optional.Parameters)
+	}
+	if !slices.Equal(composite.Parameters, []string{"year"}) {
+		t.Fatalf("composite parameters = %#v, want [year]", composite.Parameters)
+	}
+
+	for _, test := range []struct {
+		target string
+		want   int
+	}{
+		{target: "/items", want: http.StatusNotFound},
+		{target: "/items/value", want: http.StatusNoContent},
+		{target: "/reports/report-2026", want: http.StatusNoContent},
+		{target: "/reports/2026", want: http.StatusNotFound},
+	} {
+		response := httptest.NewRecorder()
+		e.ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, test.target, nil))
+		if response.Code != test.want {
+			t.Fatalf("GET %s status = %d, want %d", test.target, response.Code, test.want)
+		}
 	}
 }
 
@@ -1548,7 +1701,24 @@ func TestProviderTraceFieldsOnHandlerAndAccessLines(t *testing.T) {
 				Logger: logger, Preset: tt.preset, TraceContextLevel: tt.traceLevel,
 			}))
 			e.GET("/", func(c *echo.Context) error {
-				Logger(c.Request().Context()).Info("handler cloud log")
+				spoofed := []zap.Field{}
+				switch tt.preset {
+				case PresetGCP:
+					spoofed = append(
+						spoofed,
+						zap.String("logging.googleapis.com/trace", "spoofed-provider-trace"),
+						zap.Bool("logging.googleapis.com/trace_sampled", tt.flags == "00"),
+					)
+				case PresetAWS:
+					spoofed = append(spoofed, zap.String("xray_trace_id", "spoofed-xray-trace"))
+				case PresetAzure:
+					spoofed = append(
+						spoofed,
+						zap.String("operation_Id", "spoofed-operation"),
+						zap.String("operation_ParentId", "spoofed-parent"),
+					)
+				}
+				Logger(c.Request().Context()).Info("handler cloud log", spoofed...)
 				return c.NoContent(http.StatusOK)
 			})
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
@@ -1630,11 +1800,11 @@ func TestAccessLoggerFiltersReservedFields(t *testing.T) {
 	var buffer bytes.Buffer
 	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
 	reservedKeys := []string{
-		"timestamp", "level", "severity", "logger", "caller", "message", "error",
+		"timestamp", "level", "logger", "caller", "message", "error",
 		"request_id", "correlation_id", "trace_id", "parent_id", "trace_flags", "trace_sampled",
 		"trace_id_random",
 		"method", "path", "path_template", "operation_id", "status", "duration_ms",
-		"terminal_reason", "peer_ip", "remote_ip", "user_agent", "httpRequest",
+		"terminal_reason", "peer_ip", "user_agent",
 	}
 	e := echo.New()
 	e.Use(AccessLogger(AccessLoggerConfig{
@@ -1664,6 +1834,59 @@ func TestAccessLoggerFiltersReservedFields(t *testing.T) {
 	if count := strings.Count(line, `"tenant_id"`); count != 1 {
 		t.Fatalf("tenant_id count = %d, want 1: %s", count, line)
 	}
+}
+
+func TestAccessLoggerExtraFieldsPreserveContextualAndNestedFields(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	e := echo.New()
+	e.Use(AccessLogger(AccessLoggerConfig{
+		Logger: logger,
+		ExtraFields: func(*echo.Context) []zap.Field {
+			return []zap.Field{
+				zap.String("remote_ip", "application-peer"),
+				zap.String("logging.googleapis.com/spanId", "application-span"),
+				zap.String("logging.googleapis.com/future", "provider-extension"),
+				zap.Any("logging.googleapis.com/labels", map[string]string{"component": "worker"}),
+				zap.String("obs.custom", "visible"),
+				zap.String("_obs_debug", "visible"),
+				zap.Namespace("job"),
+				zap.String("status", "running"),
+				zap.String("method", "worker"),
+				zap.String("request_id", "nested-request"),
+			}
+		},
+	}))
+	e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	request.Header.Set(defaultRequestIDHeader, "req-extra-nested")
+	e.ServeHTTP(httptest.NewRecorder(), request)
+
+	line := strings.TrimSpace(buffer.String())
+	if count := strings.Count(line, `"logging.googleapis.com/labels"`); count != 1 {
+		t.Fatalf("logging.googleapis.com/labels key count = %d, want 1; line=%s", count, line)
+	}
+	entry := decodeSingleLogLine(t, line)
+	assertFields(t, entry, map[string]any{
+		"request_id": "req-extra-nested", "status": float64(http.StatusOK),
+		"remote_ip": "application-peer", "logging.googleapis.com/spanId": "application-span",
+		"logging.googleapis.com/future": "provider-extension",
+		"obs.custom":                    "visible", "_obs_debug": "visible",
+	})
+	accessLabels, ok := entry["logging.googleapis.com/labels"].(map[string]any)
+	if !ok {
+		t.Fatalf("access labels object missing: %#v", entry)
+	}
+	assertFields(t, accessLabels, map[string]any{"component": "worker"})
+	job, ok := entry["job"].(map[string]any)
+	if !ok {
+		t.Fatalf("nested job object missing: %#v", entry)
+	}
+	assertFields(t, job, map[string]any{
+		"status": "running", "method": "worker", "request_id": "nested-request",
+	})
 }
 
 func TestAccessLoggerProtectsCallerAndRandomTraceFieldsFromExtraFields(t *testing.T) {
@@ -1708,51 +1931,110 @@ func TestAccessLoggerProtectsCallerAndRandomTraceFieldsFromExtraFields(t *testin
 	}
 }
 
-func TestAccessLoggerFiltersProviderReservedFields(t *testing.T) {
+func TestAccessLoggerProtectsActiveProviderAliasesAndRetainsInactiveAliases(t *testing.T) {
 	t.Parallel()
-	const traceparent = "00-4efaaf4d1e8720b39541901950019ee5-00f067aa0ba902b7-01"
 	providerKeys := []string{
+		"level", "severity",
 		"logging.googleapis.com/trace", "logging.googleapis.com/trace_sampled",
-		"logging.googleapis.com/spanId", "xray_trace_id", "operation_Id", "operation_ParentId",
+		"xray_trace_id", "operation_Id", "operation_ParentId", "httpRequest",
 	}
-	for _, preset := range []Preset{PresetDefault, PresetGCP, PresetAWS, PresetAzure} {
-		t.Run(string(preset), func(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		preset Preset
+	}{
+		{name: "default", preset: PresetDefault},
+		{name: "gcp", preset: PresetGCP},
+		{name: "aws", preset: PresetAWS},
+		{name: "azure", preset: PresetAzure},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 			var buffer bytes.Buffer
-			logger := newTestLogger(t, LoggerConfig{Preset: preset, Writer: &buffer})
+			logger := newTestLogger(t, LoggerConfig{Preset: tt.preset, Writer: &buffer})
 			e := echo.New()
-			e.Use(RequestContext(RequestContextConfig{Logger: logger, Preset: preset}))
+			e.Use(RequestContext(RequestContextConfig{Logger: logger, Preset: tt.preset}))
 			e.Use(AccessLogger(AccessLoggerConfig{
 				Logger: logger,
-				Preset: preset,
+				Preset: tt.preset,
 				ExtraFields: func(*echo.Context) []zap.Field {
 					return []zap.Field{
+						zap.String("level", "bad-level"),
+						zap.String("severity", "bad-severity"),
 						zap.String("logging.googleapis.com/trace", "bad-gcp-trace"),
 						zap.Bool("logging.googleapis.com/trace_sampled", false),
 						zap.String("logging.googleapis.com/spanId", "bad-gcp-span"),
 						zap.String("xray_trace_id", "bad-xray-trace"),
 						zap.String("operation_Id", "bad-azure-operation"),
 						zap.String("operation_ParentId", "bad-azure-parent"),
+						zap.String("httpRequest", "bad-http-request"),
 						zap.String("tenant_id", "tenant-1"),
 					}
 				},
 			}))
 			e.GET("/", func(c *echo.Context) error { return c.NoContent(http.StatusOK) })
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
-			req.Header.Set("Traceparent", traceparent)
 			e.ServeHTTP(httptest.NewRecorder(), req)
 			line := strings.TrimSpace(buffer.String())
-			if strings.Contains(line, "bad-") {
-				t.Fatalf("provider override leaked: %s", line)
-			}
 			for _, key := range providerKeys {
-				if count := strings.Count(line, `"`+key+`"`); count > 1 {
-					t.Fatalf("%s count = %d: %s", key, count, line)
+				wantCount := 1
+				if tt.preset == PresetGCP && (key == "logging.googleapis.com/trace" ||
+					key == "logging.googleapis.com/trace_sampled") ||
+					tt.preset == PresetAWS && key == "xray_trace_id" ||
+					tt.preset == PresetAzure && (key == "operation_Id" || key == "operation_ParentId") {
+					wantCount = 0
+				}
+				if count := strings.Count(line, `"`+key+`"`); count != wantCount {
+					t.Fatalf("%s count = %d, want %d: %s", key, count, wantCount, line)
 				}
 			}
 			entry := decodeSingleLogLine(t, line)
-			if entry["tenant_id"] != "tenant-1" {
-				t.Fatalf("custom field missing: %#v", entry)
+			want := map[string]any{
+				"logging.googleapis.com/trace":         "bad-gcp-trace",
+				"logging.googleapis.com/trace_sampled": false,
+				"xray_trace_id":                        "bad-xray-trace",
+				"operation_Id":                         "bad-azure-operation",
+				"operation_ParentId":                   "bad-azure-parent",
+				"httpRequest":                          "bad-http-request",
+				"tenant_id":                            "tenant-1",
+				"logging.googleapis.com/spanId":        "bad-gcp-span",
+			}
+			switch tt.preset {
+			case PresetGCP:
+				want["severity"] = "INFO"
+				want["level"] = "bad-level"
+				delete(want, "logging.googleapis.com/trace")
+				delete(want, "logging.googleapis.com/trace_sampled")
+				delete(want, "httpRequest")
+				request, ok := entry["httpRequest"].(map[string]any)
+				if !ok || request["requestMethod"] != http.MethodGet {
+					t.Fatalf("canonical GCP httpRequest missing: %#v", entry)
+				}
+				if strings.Contains(line, "bad-http-request") {
+					t.Fatalf("active GCP httpRequest override leaked: %s", line)
+				}
+			case PresetAWS:
+				want["level"] = "INFO"
+				want["severity"] = "bad-severity"
+				delete(want, "xray_trace_id")
+			case PresetAzure:
+				want["level"] = "INFO"
+				want["severity"] = "bad-severity"
+				delete(want, "operation_Id")
+				delete(want, "operation_ParentId")
+			default:
+				want["level"] = "INFO"
+				want["severity"] = "bad-severity"
+			}
+			assertFields(t, entry, want)
+			for _, forbidden := range []string{
+				"bad-gcp-trace", "bad-xray-trace", "bad-azure-operation", "bad-azure-parent",
+			} {
+				owned := tt.preset == PresetGCP && forbidden == "bad-gcp-trace" ||
+					tt.preset == PresetAWS && forbidden == "bad-xray-trace" ||
+					tt.preset == PresetAzure && (forbidden == "bad-azure-operation" || forbidden == "bad-azure-parent")
+				if owned && strings.Contains(line, forbidden) {
+					t.Fatalf("active provider override %q leaked: %s", forbidden, line)
+				}
 			}
 		})
 	}
@@ -1866,15 +2148,12 @@ func TestXRayTraceIDFromW3CRequiresExactly128Bits(t *testing.T) {
 	}
 }
 
-func TestRequestPathRejectsUnavailableAndNonOriginForms(t *testing.T) {
+func TestRequestPathPreservesFrameworkEscapedPathRepresentations(t *testing.T) {
 	t.Parallel()
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
-	req.URL.Path = ""
-	req.URL.Opaque = "/opaque"
-	if got := requestPath(req); got != "" {
-		t.Fatalf("opaque request path = %q, want omission", got)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "https://example.test", nil)
+	if req.URL.Path != "" {
+		t.Fatalf("framework path for authority-only target = %q, want empty", req.URL.Path)
 	}
-	req.URL.Opaque = ""
 	if got := requestPath(req); got != "" {
 		t.Fatalf("empty request path = %q, want omission", got)
 	}
@@ -1882,10 +2161,18 @@ func TestRequestPathRejectsUnavailableAndNonOriginForms(t *testing.T) {
 	if got := requestPath(req); got != "/widgets/a%2Fb" {
 		t.Fatalf("escaped request path = %q, want /widgets/a%%2Fb", got)
 	}
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/widgets/a#literal", nil)
+	if got := requestPath(req); got != "/widgets/a%23literal" {
+		t.Fatalf("literal hash path data = %q, want /widgets/a%%23literal", got)
+	}
 	req.URL.Path = "/widgets/a/b"
 	req.URL.RawPath = "/widgets/a%2G"
-	if got := requestPath(req); got != "" {
-		t.Fatalf("requestPath() repaired malformed raw path as %q", got)
+	if got := requestPath(req); got != "/widgets/a/b" {
+		t.Fatalf("requestPath() = %q, want framework EscapedPath fallback", got)
+	}
+	req = httptest.NewRequestWithContext(t.Context(), http.MethodOptions, "*", nil)
+	if got := requestPath(req); got != "*" {
+		t.Fatalf("asterisk-form requestPath() = %q, want *", got)
 	}
 }
 
