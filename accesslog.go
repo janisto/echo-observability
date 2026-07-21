@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/labstack/echo/v5"
 	"go.uber.org/zap"
@@ -62,7 +63,7 @@ func AccessLogger(config AccessLoggerConfig) echo.MiddlewareFunc {
 					} else if hasStatus {
 						level = safeStatusLevel(cfg.StatusLevel, status)
 					}
-					entry := logger.Check(level, "request completed")
+					entry := trustedLogger(logger).Check(level, "request completed")
 					if entry == nil {
 						return
 					}
@@ -209,11 +210,12 @@ func loggerWithMetadata(
 	metadata *requestMetadata,
 	preset Preset,
 ) *zap.Logger {
-	if logger == nil {
-		logger = noopLogger
-	}
+	logger, guarded := unwrapApplicationLogger(logger)
 	logger = logger.With(requestMetadataFields(metadata)...)
 	if metadata == nil {
+		if guarded {
+			return guardApplicationLogger(logger)
+		}
 		return logger
 	}
 	switch preset {
@@ -223,6 +225,9 @@ func loggerWithMetadata(
 		logger = logger.With(awsTraceFields(metadata.Trace)...)
 	case PresetAzure:
 		logger = logger.With(azureTraceFields(metadata.Trace)...)
+	}
+	if guarded {
+		return guardApplicationLogger(logger)
 	}
 	return logger
 }
@@ -313,7 +318,9 @@ func accessLogFields(
 }
 
 func singleValidUserAgent(values []string) (string, bool) {
-	if len(values) != 1 || values[0] == "" {
+	if len(values) != 1 || values[0] == "" || !utf8.ValidString(values[0]) ||
+		values[0][0] == ' ' || values[0][0] == '\t' ||
+		values[0][len(values[0])-1] == ' ' || values[0][len(values[0])-1] == '\t' {
 		return "", false
 	}
 	for _, character := range []byte(values[0]) {
@@ -396,8 +403,13 @@ func appendExtraFields(fields, extra []zap.Field) []zap.Field {
 }
 
 func isReservedLogField(key string) bool {
+	if strings.HasPrefix(key, "logging.googleapis.com/") ||
+		strings.HasPrefix(key, "obs.") ||
+		strings.HasPrefix(key, "_obs_") {
+		return true
+	}
 	switch key {
-	case "timestamp", "level", "severity", "logger", "caller", "message", "error",
+	case "timestamp", "level", "severity", "logger", "caller", "stacktrace", "message", "error",
 		"request_id", "correlation_id", "trace_id", "parent_id", "trace_flags", "trace_sampled",
 		"trace_id_random",
 		"xray_trace_id", "operation_Id", "operation_ParentId", "method", "path", "path_template",
@@ -515,6 +527,14 @@ func formatProtoDuration(duration time.Duration) string {
 	if nanos == 0 {
 		return fmt.Sprintf("%ds", seconds)
 	}
-	fraction := strings.TrimRight(fmt.Sprintf("%09d", nanos), "0")
+	var fraction string
+	switch {
+	case nanos%1_000_000 == 0:
+		fraction = fmt.Sprintf("%03d", nanos/1_000_000)
+	case nanos%1_000 == 0:
+		fraction = fmt.Sprintf("%06d", nanos/1_000)
+	default:
+		fraction = fmt.Sprintf("%09d", nanos)
+	}
 	return fmt.Sprintf("%d.%ss", seconds, fraction)
 }

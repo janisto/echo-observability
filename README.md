@@ -292,7 +292,8 @@ missing, but explicit installation of both middlewares is preferred. It emits:
 - `duration_ms`
 - `terminal_reason` — `service_error` for returned errors or `panic`
 - `peer_ip` — direct `Request.RemoteAddr` peer when `CapturePeerIP` is enabled
-- `user_agent` when `CaptureUserAgent` is enabled
+- `user_agent` when `CaptureUserAgent` is enabled and exactly one UTF-8 RFC
+  9110 field-content value is available
 - `error` — returned Echo error only with the privacy-sensitive `CaptureError` opt-in
 
 The request-scoped fields are `request_id`, `correlation_id`, and, for valid
@@ -311,9 +312,14 @@ absent from this package's record rather than guessed from
 Use `ExtraFields` for application-owned access-log fields. Package-owned and
 provider-owned field names are ignored to prevent duplicate JSON keys.
 If the returned Zap field slice repeats a custom key, the first value wins.
-That collision guarantee applies to package-controlled context and access
-merges. Arbitrary fields passed directly to a raw Zap logger are application
-owned; callers must not reuse package-reserved names or emit duplicate keys.
+The logger returned by `NewLogger`, including request-scoped derivatives of
+that logger returned by `Logger(ctx)`, drops direct reserved Zap fields before
+encoding while preserving ordinary application fields and Zap's native
+application-error field. Inline marshalers, externally supplied Zap loggers,
+and custom core wrappers placed around a package logger cannot be inspected or
+rewrapped safely without changing core admission, sampling, or hook behavior;
+their fields remain integration preconditions. A raw Zap logger that never
+passes through this package is outside the contract.
 `ExtraFields` is evaluated only when the selected access-log level is enabled,
 so suppressed logs do not run application enrichment callbacks.
 
@@ -378,6 +384,12 @@ e.Use(
 )
 ```
 
+The provider-neutral [`examples/basic`](examples/basic) leaves the trace-level
+fields unset for its default Level 1 server. Its `newLevel2App` shows the Level
+2 opt-in by assigning `TraceContextLevel2` to both middleware configs. The
+native test sends flags `03` through both paths and verifies that only Level 2
+emits `trace_id_random`.
+
 `ResolveTraceContextLevel(0)` exposes the effective default. Unsupported
 levels fail during middleware construction. Exactly one raw `traceparent`
 field-line is eligible. Version `00` uses exact framing; future-version suffix
@@ -399,6 +411,8 @@ segments.
 ## Cloud Presets
 
 Use the same preset for `NewLogger`, `RequestContext`, and `AccessLogger`.
+A preset mismatch is rejected at the first request-composition boundary,
+regardless of middleware order.
 
 ```go
 profileVersion, err := obs.ResolveGCPProfileVersion(obs.PresetGCP, "")
@@ -516,9 +530,11 @@ generator returns invalid data twice, a process-local atomic fallback is used.
 
 The default validator accepts 1–128 ASCII characters from the unreserved URI
 set: letters, digits, `-`, `.`, `_`, and `~`. A custom validator may admit a
-broader nonempty value within Go's native HTTP field-value boundary, including
-punctuation, obs-text bytes, and values longer than 128 bytes. It is never
-applied to generated or package-fallback IDs. The configured generator is tried
+broader value within RFC 9110 field content and Go's exact
+response-header/UTF-8 JSON boundary, including punctuation, internal space or
+tab, Unicode text, and values longer than 128 bytes. Edge whitespace, controls,
+and invalid UTF-8 bytes are rejected before the callback. It is never applied
+to generated or package-fallback IDs. The configured generator is tried
 exactly twice unless its first result passes the baseline. Validator and
 generator panics are contained as rejection or failure and do not bypass the
 handler. Invalid client input is replaced, never copied to response headers or

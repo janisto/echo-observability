@@ -57,7 +57,7 @@ func TestHealthRouteEmitsCorrelatedApplicationAndAccessLogs(t *testing.T) {
 		t.Fatalf("httpRequest = %#v, want GCP request object", access["httpRequest"])
 	}
 	assertFields(t, httpRequest, map[string]any{
-		"requestMethod": "GET", "status": float64(200), "latency": "0.0125s",
+		"requestMethod": "GET", "status": float64(200), "latency": "0.012500s",
 	})
 	for _, key := range []string{"requestUrl", "remoteIp", "userAgent"} {
 		if _, ok := httpRequest[key]; ok {
