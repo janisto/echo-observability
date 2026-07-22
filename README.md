@@ -8,7 +8,9 @@
 
 `echo-observability` provides request correlation, request-scoped Zap loggers,
 and structured Zap access logging middleware for
-[Labstack Echo v5](https://github.com/labstack/echo).
+[Labstack Echo v5](https://github.com/labstack/echo). It also provides a small
+standard `net/http` request-context middleware for services that have non-Echo
+routes.
 
 ## Why this package exists
 
@@ -65,7 +67,7 @@ package name is `obs`.
 This is not official Echo middleware. It is a small, opinionated package for
 services that want a consistent production logging contract on Echo v5.
 
-## When To Use It
+## When to use it
 
 Use this package when an Echo v5 service needs:
 
@@ -84,30 +86,30 @@ Use this package when an Echo v5 service needs:
 This package also does not create metrics, Prometheus endpoints, or separate
 endpoint exporters.
 
-## Requirements
+<a id="requirements"></a>
+
+## Requirements and installation
 
 - Go 1.25 or newer; deploy with the latest available patch release.
 - Echo v5.2.0 or newer within the Echo v5 line.
 - Zap.
 
-The v1 API and log contract remains available at the unsuffixed module path.
+The v1 API and log contract remain available at the unsuffixed module path.
 This checkout targets v2 because its privacy defaults and structured output are
 intentionally incompatible with v1. See the changelog migration section before
 upgrading.
 Version 2 provides no v1 field aliases, option shims, or unsuffixed import
 fallback; applications must migrate to the documented v2 API and module path.
 
-## Install
-
 ```sh
 go get github.com/janisto/echo-observability/v2
 ```
 
-## Quick Start
+## Complete setup
 
 When this documentation shows one configuration, it uses GCP. Complete
 runnable GCP, provider-neutral, AWS, and Azure applications are available in
-[`examples`](examples).
+[`examples`](examples), with usage notes in [EXAMPLES.md](EXAMPLES.md).
 
 ```go
 package main
@@ -208,9 +210,10 @@ Defaults:
 | Request ID format | 32 lowercase hexadecimal characters |
 
 Incoming request IDs are at most 128 bytes and may contain ASCII letters,
-digits, `-`, `.`, `_`, and `~`. A custom `ValidateRequestID` may further
-restrict that baseline but cannot admit an unsafe value. Multiple raw request
-ID field-lines are ambiguous and cause a replacement ID to be generated.
+digits, `-`, `.`, `_`, and `~`. A custom `ValidateRequestID` may broaden or
+restrict that baseline within RFC 9110 field content and Go's native HTTP
+response-header and UTF-8 JSON boundary. Multiple raw request ID field-lines are
+ambiguous and cause a replacement ID to be generated.
 Set `DisableResponseHeader` when the request ID must not be returned.
 
 Access metadata anywhere a standard `context.Context` is available:
@@ -252,7 +255,7 @@ use `AccessLogger`; access logging for non-Echo routes remains
 application-owned. The same header, generation, validation, response-header,
 logger, and preset options are available in `HTTPRequestContextConfig`.
 
-## Handler Logging
+## Handler logging
 
 Use `obs.Logger(ctx)` anywhere a standard request context is available:
 
@@ -272,7 +275,7 @@ Background jobs, scripts, direct service calls, and tests using
 `context.Background()` must use an explicit process logger; `obs.Logger(ctx)`
 is intentionally a no-op outside installed request metadata.
 
-## Access Logger
+## Access logger
 
 `AccessLogger` installs request metadata by itself when `RequestContext` is
 missing, but explicit installation of both middlewares is preferred. It emits:
@@ -304,21 +307,25 @@ absent from this package's record rather than guessed from
 `echo.HTTPStatusCoder`.
 
 Use `ExtraFields` for application-owned access-log fields. Exact fields owned
-by the access envelope, correlation metadata, or selected provider profile are
+by the access envelope, correlation metadata, or selected provider preset are
 ignored at the top level to prevent duplicate JSON keys. Exact aliases owned
-only by an inactive provider profile, other provider-looking names, and
+only by an inactive provider preset, other provider-looking names, and
 application namespace keys remain application-owned. Fields after
 `zap.Namespace` are nested and cannot collide with package-owned top-level
 fields. If the returned slice repeats a custom key, the first value wins.
+Inline object marshalers returned by `ExtraFields` are ignored because their
+inner keys cannot be checked before they enter the access-record namespace.
+
 The logger returned by `NewLogger`, including request-scoped derivatives of
 that logger returned by `Logger(ctx)`, protects only exact application-envelope,
-correlation, and selected provider-profile fields at the top level. Access-only
+correlation, and selected provider-preset fields at the top level. Access-only
 fields and fields inside `zap.Namespace` remain application-owned. Inline
 marshalers, externally supplied Zap loggers,
 and custom core wrappers placed around a package logger cannot be inspected or
 rewrapped safely without changing core admission, sampling, or hook behavior;
 their fields remain integration preconditions. A raw Zap logger that never
 passes through this package is outside the contract.
+
 `ExtraFields` is evaluated only when the selected access-log level is enabled,
 so suppressed logs do not run application enrichment callbacks.
 
@@ -342,7 +349,7 @@ e.Use(obs.AccessLogger(obs.AccessLoggerConfig{
 warn, and all other statuses are info. Abnormal terminal reasons always use
 error. `Now` exists for deterministic testing.
 
-## Named Routes
+## Named routes
 
 Echo assigns an internal default route name. `operation_id` is emitted only
 for an explicitly named route:
@@ -363,7 +370,7 @@ templates are preserved in their authoritative native form rather than rejected
 by a package-invented grammar. Group metrics or logs by `path_template`, not
 `path`, to avoid high-cardinality dimensions.
 
-## Trace Correlation
+## Trace correlation
 
 W3C `traceparent` is the only trace input. A valid trace ID becomes
 `correlation_id`; otherwise `correlation_id` falls back to `request_id`.
@@ -401,7 +408,7 @@ Provider-specific headers such as `X-Cloud-Trace-Context`,
 parsed. The package correlates logs; it does not create spans or provider trace
 segments.
 
-## Cloud Presets
+## Cloud presets
 
 Use the same preset for `NewLogger`, `RequestContext`, and `AccessLogger`.
 A preset mismatch is rejected at the first request-composition boundary,
@@ -439,11 +446,13 @@ GCP `httpRequest.requestUrl` is the exact captured path only, never scheme,
 authority, query, or fragment. `remoteIp` and `userAgent` appear only when the
 corresponding portable privacy option is enabled.
 
-Captured paths and peers are validated rather than repaired: unavailable or
-non-origin-form paths are omitted, and peer fields contain only canonical
-unzoned IPv4 or IPv6 address literals. GCP severities always use `DEBUG`,
-`INFO`, `WARNING`, `ERROR`, or `CRITICAL`. A custom status mapper returning a
-terminal or unknown Zap level falls back to the default status mapping.
+Captured paths use the nonempty escaped URL path exactly as exposed at the
+middleware boundary, including `*`; unavailable paths are omitted. The result
+never includes a scheme, authority, query, or fragment. Peer fields contain
+only canonical unzoned IPv4 or IPv6 address literals. GCP severities always use
+`DEBUG`, `INFO`, `WARNING`, `ERROR`, or `CRITICAL`. A custom status mapper
+returning a terminal or unknown Zap level falls back to the default status
+mapping.
 
 ### AWS
 
@@ -466,7 +475,7 @@ configuration.
 An incoming W3C parent ID is not emitted as a current span ID. A current span
 ID can only come from real tracing instrumentation.
 
-## Field Contract
+## Structured log contract
 
 Every JSON line created by `NewLogger` uses:
 
@@ -487,20 +496,19 @@ Request-scoped lines add:
 Access lines add:
 
 - `method`.
-- `path`: escaped concrete URL path without the query string, when opted in.
+- `path`: nonempty escaped URL path, including `*`, when opted in; scheme,
+  authority, query, and fragment are never included.
 - `path_template`: parameterized Echo route path when matched.
 - `operation_id`: explicitly configured Echo route name.
 - `status`, only when committed before the middleware boundary returns.
 - `duration_ms`.
 - `terminal_reason` for returned errors and panics.
 - `peer_ip`: direct transport peer from `Request.RemoteAddr`, when opted in.
-- `user_agent` when opted in and present.
-- `error` when Echo middleware or the handler returns an error and `CaptureError` is enabled.
+- `user_agent` when opted in and exactly one valid UTF-8 RFC 9110 field-content
+  value is present.
+- `error` when Echo middleware or the handler returns an error and
+  `CaptureError` is enabled.
 - `httpRequest` for the GCP preset only.
-
-`ExtraFields` applies only to the access line. Exact package-owned top-level
-keys are ignored so custom fields cannot produce duplicate or forged owned
-values; nested and non-owned provider-looking fields remain application-owned.
 
 ## Request IDs
 
@@ -520,7 +528,7 @@ application side effects. Validator and generator panics are contained and do
 not bypass the handler. Invalid client input is replaced, never copied to
 response headers or logs.
 
-## Middleware Placement
+## Middleware placement
 
 Install request context and access logging at the outer observability boundary
 so downstream middleware failures are correlated and logged:
@@ -553,7 +561,7 @@ Keep the observability pair outside middleware such as `BodyLimit`, CORS, and
 authentication when their rejected requests must also receive request IDs and
 access logs.
 
-## Logger Configuration
+## Logger configuration
 
 `NewLogger` writes JSON application logs to stdout and Zap internal errors to
 stderr by default. `LoggerConfig` supports `Level`, `Writer`, `ErrorWriter`,
@@ -571,7 +579,7 @@ logger = logger.With(
 Do not log authorization headers, cookies, tokens, request bodies, or other
 secrets and personal data.
 
-## Panic Behavior
+## Panic behavior
 
 `AccessLogger` recovers a panic only long enough to emit an `ERROR` access log
 with terminal reason `panic`, then re-panics with the original value. An
@@ -587,7 +595,7 @@ Install the application's recovery middleware outside it—earlier in the
 preserving the `panic` terminal classification. The package never swallows a
 downstream handler panic or owns the response format.
 
-## Optional Local Wrapper
+## Optional local wrapper
 
 Projects that prefer application-specific helpers can wrap the context API
 without introducing another logging backend. A complete tested example is in
@@ -602,7 +610,7 @@ func Info(ctx context.Context, msg string, fields ...zap.Field) {
 Keep the wrapper local to the application. This package intentionally exposes
 Zap directly rather than defining a second logger interface.
 
-## Validation
+## Development
 
 Development uses [just](https://github.com/casey/just). On macOS, install the
 workflow linters:
@@ -619,17 +627,17 @@ just qa
 just vuln
 ```
 
-`just qa` validates the Go 1.25 support line with formatting, lint, build,
-tests, race tests, [actionlint](https://github.com/rhysd/actionlint), and
+`just qa` includes formatting, lint, build, tests, race tests,
+[actionlint](https://github.com/rhysd/actionlint), and
 [zizmor](https://docs.zizmor.sh/). `just vuln` runs the Go vulnerability scanner
-separately.
+separately. Maintainers should follow the public [release guide](RELEASE.md).
 
 The suite covers the real Echo adapter path, standard `net/http` composition,
 request ID and trace boundaries, returned and committed response errors,
 panic rethrow, concurrent logging, cloud field contracts, reserved fields,
 and request-context immutability. `ParseTraceparent` also has a fuzz target.
 
-## Mutation Testing
+## Mutation testing
 
 Install [Gremlins](https://github.com/go-gremlins/gremlins) with Homebrew on
 macOS:
@@ -651,7 +659,7 @@ gaps; equivalent transformations do not need artificial assertions. Mutation
 testing intentionally runs outside `just qa` and may take several minutes. The
 configured per-mutant safety timeout does not limit the total campaign time.
 
-## Fuzz Testing
+## Fuzz testing
 
 This repository uses Go's native fuzzing engine for `FuzzParseTraceparent`.
 Run the default ten-second session with:
@@ -680,6 +688,18 @@ fix when it represents behavior the parser must preserve.
 
 See the [Go fuzzing documentation](https://go.dev/doc/security/fuzz/) for the
 engine's workflow and additional flags.
+
+## Consumer image
+
+Run `just e2e-image observability-e2e-local:manual` to build a
+production-shaped consumer image from the exact checkout. The recipe prefers
+Podman and falls back to Docker.
+
+Building the image verifies packaging and integration only. It does not run the
+image, validate emitted logs, compare implementations, or approve a release.
+Optional independent tooling may exercise the public contract documented in
+[`e2e/README.md`](e2e/README.md). Any audit result is informational and is never
+a publication requirement.
 
 ## References
 

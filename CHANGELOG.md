@@ -32,79 +32,84 @@ module path.
 
 ### Added
 
-- Add GCP, AWS, and Azure provider presets.
-- Add independent `CapturePath`, `CapturePeerIP`, `CaptureUserAgent`, and
+- Added independent `CapturePath`, `CapturePeerIP`, `CaptureUserAgent`, and
   `CaptureError` access-log opt-ins.
-- Add immutable W3C Trace Context Level 1/Level 2 selection, effective-level
+- Added immutable W3C Trace Context Level 1/Level 2 selection, effective-level
   resolution, complete selected-level `tracestate` validation, and Level 2
   `trace_id_random` projection.
+- Added a conditional consumer-image build as a packaging and integration
+  diagnostic, with Podman-first local builds and Docker fallback. Optional
+  independent audits are informational and never a publication requirement.
 
 ### Changed
 
-- Apply the RFC 9110 field-content and valid UTF-8 boundary before custom
+- Applied the RFC 9110 field-content and valid UTF-8 boundary before custom
   request-ID validation.
-- Renamed the remaining internal direct-peer field so v2 source no longer
-  models the removed portable `remote_ip` name. The required GCP
-  `httpRequest.remoteIp` output member is unchanged.
-- Documented LF-terminated NDJSON as the logging boundary and added focused
-  raw-writer coverage for independently parseable records.
-- Omit invalid UTF-8 User-Agent field values before Zap encoding can replace
-  their bytes; preserve framework-accepted Unicode and internal whitespace.
-
-- **Breaking:** Omit raw path, direct peer IP, user agent, and returned error
+- Defined LF-terminated NDJSON as the logging boundary.
+- Omitted invalid UTF-8 User-Agent field values before Zap encoding could
+  replace their bytes; preserved framework-accepted Unicode and internal
+  whitespace.
+- Omitted raw path, direct peer IP, user agent, and returned error
   text from access logs by default. Applications that need them must enable
   the matching options.
-- **Breaking:** Rename the opt-in direct-peer field from `remote_ip` to
+- Renamed the opt-in direct-peer field from `remote_ip` to
   `peer_ip`; it now reads only `Request.RemoteAddr` and ignores Echo proxy IP
-  extraction. Narrow GCP `httpRequest.requestUrl` to the query-free path.
-- Align the GCP health fixture to service version `1.0.0`, operation
-  `health_check`, and deterministic 12.5 ms access timing.
-- **Breaking:** Reject duplicate raw request-ID and `traceparent` field-lines;
+  extraction. Narrowed GCP `httpRequest.requestUrl` to the query-free path.
+- Rejected duplicate raw request-ID and `traceparent` field-lines;
   custom request-ID validators can broaden caller input within Go's native HTTP
   field-value boundary while generated IDs remain strict.
-- **Breaking:** Remove status inference from errors handled later by Echo, add
-  `service_error` and `panic` terminal reasons, and make abnormal records
+- Removed status inference from errors handled later by Echo, added
+  `service_error` and `panic` terminal reasons, and made abnormal records
   unconditionally `ERROR` while preserving returned errors and panics.
-- Contain panics from the access clock, status mapper, enrichment callback, and
-  writer without changing the response; keep the first repeated custom field
-  so package-controlled JSON contains no duplicate member names.
-- **Breaking:** Canonicalize simple Echo `:name` and terminal `*` route metadata
-  to portable `{name}` and `{*path}` templates; preserve richer nonempty matched
-  templates in Echo's authoritative native form.
-- Fold every GCP severity into the portable five-level vocabulary, reject
-  terminal or unknown status-callback levels, omit unavailable request paths,
-  and emit only canonical unzoned IP address literals for direct peers.
+- Contained panics from the access clock, status mapper, enrichment callback,
+  and writer without changing the response.
+- Kept the first repeated custom field so package-controlled JSON contains no
+  duplicate member names.
+- Canonicalized simple Echo `:name` and terminal `*` route metadata
+  to portable `{name}` and `{*path}` templates; preserved richer nonempty
+  matched templates in Echo's authoritative native form.
+- Folded every GCP severity into the portable five-level vocabulary, rejected
+  terminal or unknown status-callback levels, omitted unavailable request
+  paths, and emitted only canonical unzoned IP address literals for direct
+  peers.
+
+### Removed
+
+- Removed v1 compatibility aliases and configuration shims from the v2 API.
 
 ### Fixed
 
-- Protect only exact record-owned top-level fields in raw NDJSON, while
+- Protected only exact record-owned top-level fields in raw NDJSON, while
   preserving access-only application fields, exact aliases owned only by an
-  inactive provider profile, other non-owned provider-looking keys, application
+  inactive provider preset, other non-owned provider-looking keys, application
   namespaces, and reserved-looking fields nested with `zap.Namespace`.
-- Preserve the selected provider preset through `HTTPRequestContext`, reject a
-  mismatched preset whenever existing request metadata is reused, and call a
-  configured request-ID generator once before using the package fallback.
-- Preserve framework-exposed escaped request paths, including asterisk-form
-  paths, without package-invented percent-encoding validation; keep the default
-  request-ID entropy path on successful reads; and align repository metadata
-  with the `/v2` module identity.
-- Emit GCP `httpRequest.latency` with canonical ProtoJSON fractional widths:
+- Preserved the selected provider preset through `HTTPRequestContext`, rejected
+  a mismatched preset whenever existing request metadata is reused, and called
+  a configured request-ID generator once before using the package fallback.
+- Preserved framework-exposed escaped request paths, including asterisk-form
+  paths, without package-invented percent-encoding validation.
+- Kept the default request-ID entropy path on successful reads and used the
+  package fallback only on read failure.
+- Emitted GCP `httpRequest.latency` with canonical ProtoJSON fractional widths:
   0, 3, 6, or 9 digits according to the required precision.
-- Preserve framework-valid route parameter names, including colon-bearing and
+- Preserved framework-valid route parameter names, including colon-bearing and
   longer names, HTTP-safe opaque future `traceparent` suffixes without an
   invented length cap, valid `tracestate` beyond 512 characters, HTAB
   User-Agent values, custom-admitted request IDs, and nonempty static operation
-  IDs. Reject provider-preset or trace-level disagreement regardless of
-  middleware order, reject unknown presets consistently, and protect Zap-owned
-  caller and Level 2 trace fields.
-- Admit a comma in one request-ID field-line when the configured application
-  validator accepts it; real duplicate field-lines remain rejected.
-- Install recovery outside access logging in Echo's middleware chain so panic
+  IDs. Rejected provider-preset or trace-level disagreement regardless of
+  middleware order, rejected unknown presets consistently, and protected
+  Zap-owned caller and Level 2 trace fields.
+- Admitted a comma in one request-ID field-line when the configured
+  application validator accepts it; real duplicate field-lines remain
+  rejected.
+- Installed recovery outside access logging in Echo's middleware chain so panic
   access records retain `terminal_reason: "panic"` before recovery creates the
   application response.
-
-- Preserve sampling while omitting the Level 2 random flag for unknown future
+- Preserved sampling while omitting the Level 2 random flag for unknown future
   `traceparent` versions.
+- Rejected `zap.Inline` values from access-log `ExtraFields` so nested
+  marshalers cannot bypass reserved-key collision protection.
+
 ## [1.0.1] - 2026-07-17
 
 ### Changed
