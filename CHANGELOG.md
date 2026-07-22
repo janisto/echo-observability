@@ -7,9 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
-The changes in this section target `v2.0.0` under module path
-`github.com/janisto/echo-observability/v2`. They must not be tagged on the v1
-module path.
+## [2.0.0] - 2026-07-22
+
+Version 2 uses module path `github.com/janisto/echo-observability/v2` and cannot
+be tagged on the v1 module path.
 
 ### Migration from v1
 
@@ -178,7 +179,8 @@ module path.
 - Add runnable cloud examples, a tested local wrapper, public documentation,
   CI, linting, and dependency automation.
 
-[Unreleased]: https://github.com/janisto/echo-observability/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/janisto/echo-observability/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/janisto/echo-observability/compare/v1.0.1...v2.0.0
 [1.0.1]: https://github.com/janisto/echo-observability/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/janisto/echo-observability/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/janisto/echo-observability/compare/v0.1.0...v0.2.0
