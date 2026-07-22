@@ -155,15 +155,10 @@ func serveHealth(
 ) (*httptest.ResponseRecorder, []map[string]any) {
 	t.Helper()
 	var output bytes.Buffer
-	var profileVersion obs.GCPProfileVersion
-	if preset == obs.PresetGCP {
-		profileVersion = obs.GCPProfileVersionV0_1_0
-	}
 	logger, err := obs.NewLogger(obs.LoggerConfig{
-		Preset:            preset,
-		GCPProfileVersion: profileVersion,
-		Level:             level,
-		Writer:            &output,
+		Preset: preset,
+		Level:  level,
+		Writer: &output,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -177,7 +172,7 @@ func serveHealth(
 	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/health", nil)
 	request.Header.Set("X-Request-ID", "health-example")
 	recorder := httptest.NewRecorder()
-	app, err := newAppWithPreset(logger, preset, profileVersion, fixedGCPHealthClock())
+	app, err := newAppWithPreset(logger, preset, fixedGCPHealthClock())
 	if err != nil {
 		t.Fatal(err)
 	}

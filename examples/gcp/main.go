@@ -13,20 +13,15 @@ import (
 )
 
 func main() {
-	profileVersion, err := obs.ResolveGCPProfileVersion(obs.PresetGCP, "")
-	if err != nil {
-		panic(err)
-	}
 	logger, err := obs.NewLogger(obs.LoggerConfig{
-		Preset:            obs.PresetGCP,
-		GCPProfileVersion: profileVersion,
-		Level:             zapcore.DebugLevel,
+		Preset: obs.PresetGCP,
+		Level:  zapcore.DebugLevel,
 	})
 	if err != nil {
 		panic(err)
 	}
 
-	e, err := newApp(logger, profileVersion, nil)
+	e, err := newApp(logger, nil)
 	if err != nil {
 		panic(err)
 	}
@@ -35,14 +30,13 @@ func main() {
 	}
 }
 
-func newApp(logger *zap.Logger, profileVersion obs.GCPProfileVersion, now func() time.Time) (*echo.Echo, error) {
-	return newAppWithPreset(logger, obs.PresetGCP, profileVersion, now)
+func newApp(logger *zap.Logger, now func() time.Time) (*echo.Echo, error) {
+	return newAppWithPreset(logger, obs.PresetGCP, now)
 }
 
 func newAppWithPreset(
 	logger *zap.Logger,
 	preset obs.Preset,
-	profileVersion obs.GCPProfileVersion,
 	now func() time.Time,
 ) (*echo.Echo, error) {
 	e := echo.New()
@@ -50,10 +44,9 @@ func newAppWithPreset(
 		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: preset}),
 		middleware.Recover(),
 		obs.AccessLogger(obs.AccessLoggerConfig{
-			Logger:            logger,
-			Preset:            preset,
-			GCPProfileVersion: profileVersion,
-			Now:               now,
+			Logger: logger,
+			Preset: preset,
+			Now:    now,
 		}),
 	)
 	_, err := e.AddRoute(echo.Route{

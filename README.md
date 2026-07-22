@@ -124,14 +124,9 @@ import (
 )
 
 func main() {
-	profileVersion, err := obs.ResolveGCPProfileVersion(obs.PresetGCP, "")
-	if err != nil {
-		panic(err)
-	}
 	logger, err := obs.NewLogger(obs.LoggerConfig{
-		Preset:            obs.PresetGCP,
-		GCPProfileVersion: profileVersion,
-		Level:             zapcore.DebugLevel,
+		Preset: obs.PresetGCP,
+		Level:  zapcore.DebugLevel,
 	})
 	if err != nil {
 		panic(err)
@@ -142,9 +137,8 @@ func main() {
 		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: obs.PresetGCP}),
 		middleware.Recover(),
 		obs.AccessLogger(obs.AccessLoggerConfig{
-			Logger:            logger,
-			Preset:            obs.PresetGCP,
-			GCPProfileVersion: profileVersion,
+			Logger: logger,
+			Preset: obs.PresetGCP,
 		}),
 	)
 
@@ -336,9 +330,8 @@ different, application-owned concept.
 
 ```go
 e.Use(obs.AccessLogger(obs.AccessLoggerConfig{
-	Logger:            logger,
-	Preset:            obs.PresetGCP,
-	GCPProfileVersion: profileVersion,
+	Logger: logger,
+	Preset: obs.PresetGCP,
 	ExtraFields: func(c *echo.Context) []zap.Field {
 		return []zap.Field{zap.String("tenant_id", tenantID(c))}
 	},
@@ -390,12 +383,6 @@ e.Use(
 )
 ```
 
-The provider-neutral [`examples/basic`](examples/basic) leaves the trace-level
-fields unset for its default Level 1 server. Its `newLevel2App` shows the Level
-2 opt-in by assigning `TraceContextLevel2` to both middleware configs. The
-native test sends flags `03` through both paths and verifies that only Level 2
-emits `trace_id_random`.
-
 `ResolveTraceContextLevel(0)` exposes the effective default. Unsupported
 levels fail during middleware construction. Exactly one raw `traceparent`
 field-line is eligible. Version `00` uses exact framing; future-version suffix
@@ -421,13 +408,8 @@ A preset mismatch is rejected at the first request-composition boundary,
 regardless of middleware order.
 
 ```go
-profileVersion, err := obs.ResolveGCPProfileVersion(obs.PresetGCP, "")
-if err != nil {
-	return err
-}
 logger, err := obs.NewLogger(obs.LoggerConfig{
-	Preset:            obs.PresetGCP,
-	GCPProfileVersion: profileVersion,
+	Preset: obs.PresetGCP,
 })
 if err != nil {
 	return err
@@ -437,7 +419,7 @@ e.Use(
 		Logger: logger, Preset: obs.PresetGCP,
 	}),
 	obs.AccessLogger(obs.AccessLoggerConfig{
-		Logger: logger, Preset: obs.PresetGCP, GCPProfileVersion: profileVersion,
+		Logger: logger, Preset: obs.PresetGCP,
 	}),
 )
 ```
@@ -450,12 +432,8 @@ The GCP preset emits `severity` instead of `level`, a structured
 trace ID, which is Google Cloud's preferred format. It deliberately does not
 emit `logging.googleapis.com/spanId` from the incoming parent ID.
 
-The installed package supports GCP profile `0.1.0`. Omitting the version
-selects that newest supported version during construction; exact pinning uses
-`GCPProfileVersionV0_1_0`. `ResolveGCPProfileVersion` exposes the effective
-value without a provider, registry, or network lookup. Invalid selections make
-`NewLogger` return an error and make `AccessLogger` panic immediately during
-middleware construction because its established API has no error return.
+The installed package owns one GCP field mapping. Select it with `PresetGCP`
+for logger and middleware configuration.
 
 GCP `httpRequest.requestUrl` is the exact captured path only, never scheme,
 authority, query, or fragment. `remoteIp` and `userAgent` appear only when the
@@ -473,10 +451,8 @@ The AWS preset keeps flat `timestamp`, `level`, and `message` fields. A valid
 W3C trace also emits `xray_trace_id` in `1-8hex-24hex` form. It does not create
 X-Ray segments or treat the incoming parent ID as a current X-Ray span.
 
-The installed package supports exact current AWS profile `0.1.0`. Omission
-resolves to it at construction; pin with `AWSProfileVersionV0_1_0` and inspect
-the effective value with `ResolveAWSProfileVersion`. Other versions and
-cross-preset pins fail without a network lookup.
+Select the AWS field mapping with `PresetAWS` for logger and middleware
+configuration.
 
 ### Azure
 
@@ -484,10 +460,8 @@ The Azure preset keeps flat JSON and maps a valid W3C trace to
 `operation_Id` and `operation_ParentId`. It does not initialize Application
 Insights or create dependency/request telemetry.
 
-The installed package supports exact current Azure profile `0.1.0`. Omission
-resolves to it at construction; pin with `AzureProfileVersionV0_1_0` and
-inspect the effective value with `ResolveAzureProfileVersion`. Other versions
-and cross-preset pins fail without a network lookup.
+Select the Azure field mapping with `PresetAzure` for logger and middleware
+configuration.
 
 An incoming W3C parent ID is not emitted as a current span ID. A current span
 ID can only come from real tracing instrumentation.
@@ -560,7 +534,6 @@ e.Use(
 	obs.AccessLogger(obs.AccessLoggerConfig{
 		Logger: logger,
 		Preset: obs.PresetGCP,
-		GCPProfileVersion: profileVersion,
 	}),
 	middleware.CORS(),
 	middleware.BodyLimit(1<<20),

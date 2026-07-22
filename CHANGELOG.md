@@ -32,8 +32,7 @@ module path.
 
 ### Added
 
-- Add exact current `0.1.0` profiles for GCP, AWS, and Azure with default
-  resolution, exact pinning, and effective-version introspection.
+- Add GCP, AWS, and Azure provider presets.
 - Add independent `CapturePath`, `CapturePeerIP`, `CaptureUserAgent`, and
   `CaptureError` access-log opt-ins.
 - Add immutable W3C Trace Context Level 1/Level 2 selection, effective-level
@@ -44,8 +43,6 @@ module path.
 
 - Apply the RFC 9110 field-content and valid UTF-8 boundary before custom
   request-ID validation.
-- Expanded the provider-neutral basic example with the Level 1 default, an
-  explicit Level 2 application path, and behavioral output tests.
 - Renamed the remaining internal direct-peer field so v2 source no longer
   models the removed portable `remote_ip` name. The required GCP
   `httpRequest.remoteIp` output member is unchanged.
@@ -108,9 +105,6 @@ module path.
 
 - Preserve sampling while omitting the Level 2 random flag for unknown future
   `traceparent` versions.
-- Lock the exported and default-resolved GCP profile identifier to the literal
-  `0.1.0` in native regression tests.
-
 ## [1.0.1] - 2026-07-17
 
 ### Changed

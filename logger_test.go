@@ -211,14 +211,6 @@ func TestUnknownPresetIsRejectedAtEveryPublicConstructionBoundary(t *testing.T) 
 	t.Parallel()
 
 	const want = "observability: unknown logger preset"
-	if resolved, err := ResolveGCPProfileVersion(
-		Preset("bogus"),
-		"",
-	); resolved != "" || err == nil ||
-		err.Error() != want {
-		t.Fatalf("ResolveGCPProfileVersion(bogus) = (%q, %v), want empty and %q", resolved, err, want)
-	}
-
 	tests := []struct {
 		name      string
 		construct func()
@@ -243,116 +235,6 @@ func TestUnknownPresetIsRejectedAtEveryPublicConstructionBoundary(t *testing.T) 
 				}
 			}()
 			tt.construct()
-		})
-	}
-}
-
-func TestGCPProfileVersionResolutionAndLoggerValidation(t *testing.T) {
-	t.Parallel()
-	if GCPProfileVersionV0_1_0 != GCPProfileVersion("0.1.0") {
-		t.Fatalf("GCPProfileVersionV0_1_0 = %q, want literal 0.1.0", GCPProfileVersionV0_1_0)
-	}
-	latest, err := ResolveGCPProfileVersion(PresetGCP, "")
-	if err != nil || latest != GCPProfileVersion("0.1.0") {
-		t.Fatalf("latest GCP profile = (%q, %v), want literal 0.1.0", latest, err)
-	}
-	pinned, err := ResolveGCPProfileVersion(PresetGCP, GCPProfileVersionV0_1_0)
-	if err != nil || pinned != GCPProfileVersionV0_1_0 {
-		t.Fatalf("pinned GCP profile = (%q, %v), want %q", pinned, err, GCPProfileVersionV0_1_0)
-	}
-
-	tests := []struct {
-		name   string
-		config LoggerConfig
-		want   string
-	}{
-		{
-			name:   "unsupported version",
-			config: LoggerConfig{Preset: PresetGCP, GCPProfileVersion: "0.2.0"},
-			want:   `observability: unsupported GCP profile version "0.2.0"`,
-		},
-		{
-			name:   "cross-preset version",
-			config: LoggerConfig{Preset: PresetAWS, GCPProfileVersion: GCPProfileVersionV0_1_0},
-			want:   "observability: GCP profile version requires GCP preset",
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			logger, err := NewLogger(tt.config)
-			if logger != nil || err == nil || err.Error() != tt.want {
-				t.Fatalf("NewLogger(invalid) = (%#v, %v), want nil and %q", logger, err, tt.want)
-			}
-		})
-	}
-}
-
-func TestAWSAndAzureProfileVersionResolutionAndLoggerValidation(t *testing.T) {
-	t.Parallel()
-	for _, tt := range []struct {
-		name       string
-		preset     Preset
-		latest     string
-		resolve    func(Preset, string) (string, error)
-		config     func(string) LoggerConfig
-		wrongError string
-		crossError string
-	}{
-		{
-			name: "AWS", preset: PresetAWS, latest: string(AWSProfileVersionV0_1_0),
-			resolve: func(preset Preset, version string) (string, error) {
-				resolved, err := ResolveAWSProfileVersion(preset, AWSProfileVersion(version))
-				return string(resolved), err
-			},
-			config: func(version string) LoggerConfig {
-				return LoggerConfig{Preset: PresetAWS, AWSProfileVersion: AWSProfileVersion(version)}
-			},
-			wrongError: `observability: unsupported AWS profile version "0.2.0"`,
-			crossError: "observability: AWS profile version requires AWS preset",
-		},
-		{
-			name: "Azure", preset: PresetAzure, latest: string(AzureProfileVersionV0_1_0),
-			resolve: func(preset Preset, version string) (string, error) {
-				resolved, err := ResolveAzureProfileVersion(preset, AzureProfileVersion(version))
-				return string(resolved), err
-			},
-			config: func(version string) LoggerConfig {
-				return LoggerConfig{Preset: PresetAzure, AzureProfileVersion: AzureProfileVersion(version)}
-			},
-			wrongError: `observability: unsupported Azure profile version "0.2.0"`,
-			crossError: "observability: Azure profile version requires Azure preset",
-		},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-			if tt.latest != "0.1.0" {
-				t.Fatalf("latest literal = %q, want 0.1.0", tt.latest)
-			}
-			for _, version := range []string{"", "0.1.0"} {
-				resolved, err := tt.resolve(tt.preset, version)
-				if err != nil || resolved != "0.1.0" {
-					t.Fatalf("resolve(%q) = (%q, %v), want (0.1.0, nil)", version, resolved, err)
-				}
-				logger, err := NewLogger(tt.config(version))
-				if err != nil || logger == nil {
-					t.Fatalf("NewLogger(%q) = (%#v, %v), want logger, nil", version, logger, err)
-				}
-			}
-			if resolved, err := tt.resolve(
-				tt.preset,
-				"0.2.0",
-			); resolved != "" || err == nil ||
-				err.Error() != tt.wrongError {
-				t.Fatalf("noncurrent profile = (%q, %v), want empty and %q", resolved, err, tt.wrongError)
-			}
-			if resolved, err := tt.resolve(
-				PresetDefault,
-				"0.1.0",
-			); resolved != "" || err == nil ||
-				err.Error() != tt.crossError {
-				t.Fatalf("cross-preset profile = (%q, %v), want empty and %q", resolved, err, tt.crossError)
-			}
 		})
 	}
 }

@@ -30,14 +30,9 @@ Every service follows the same shape:
 The canonical GCP wiring is:
 
 ```go
-profileVersion, err := obs.ResolveGCPProfileVersion(obs.PresetGCP, "")
-if err != nil {
-	panic(err)
-}
 logger, err := obs.NewLogger(obs.LoggerConfig{
-	Preset:            obs.PresetGCP,
-	GCPProfileVersion: profileVersion,
-	Level:             zapcore.DebugLevel,
+	Preset: obs.PresetGCP,
+	Level:  zapcore.DebugLevel,
 })
 if err != nil {
 	panic(err)
@@ -51,9 +46,8 @@ e.Use(
 	}),
 	middleware.Recover(),
 	obs.AccessLogger(obs.AccessLoggerConfig{
-		Logger:            logger,
-		Preset:            obs.PresetGCP,
-		GCPProfileVersion: profileVersion,
+		Logger: logger,
+		Preset: obs.PresetGCP,
 	}),
 )
 ```
@@ -110,8 +104,7 @@ merely because it exceeds the 512-character minimum propagation capacity.
 
 Raw path, direct peer IP, and user agent are disabled by default and have
 independent access-log opt-ins. GCP does not change those defaults. Captured
-GCP `requestUrl` is path-only. The unpinned installed GCP profile resolves to
-`0.1.0`; use `GCPProfileVersionV0_1_0` for an exact pin.
+GCP `requestUrl` is path-only.
 
 ## Provider-Neutral JSON
 
@@ -119,13 +112,8 @@ GCP `requestUrl` is path-only. The unpinned installed GCP profile resolves to
 go run ./examples/basic
 ```
 
-The executable leaves both trace-level fields unset and therefore uses Level
-1. To enable Level 2, follow `newLevel2App`, which assigns
-`TraceContextLevel2` to both middleware configs. The package test executes the
-default and Level 2 configurations against a version-`00` traceparent with
-flags `03`. The default preset writes `level` and generic
-correlation fields without provider-specific aliases; only Level 2 emits
-`trace_id_random`.
+The default preset writes `level` and the generic correlation fields without
+provider-specific trace aliases.
 
 ## AWS
 
@@ -136,8 +124,7 @@ go run ./examples/aws
 The AWS preset keeps flat JSON. A valid W3C trace ID is also formatted as
 `xray_trace_id`, for example
 `1-4bf92f35-77b34da6a3ce929d0e0e4736`. The package does not create X-Ray
-segments or parse `X-Amzn-Trace-Id`. The exact current profile is `0.1.0`;
-omission resolves to it, and `AWSProfileVersionV0_1_0` pins it.
+segments or parse `X-Amzn-Trace-Id`.
 
 ## Azure
 
@@ -147,8 +134,7 @@ go run ./examples/azure
 
 The Azure preset maps valid W3C values to `operation_Id` and
 `operation_ParentId`. It does not initialize an Azure SDK or parse legacy
-`Request-Id` headers. The exact current profile is `0.1.0`; omission resolves
-to it, and `AzureProfileVersionV0_1_0` pins it.
+`Request-Id` headers.
 
 ## Mixed Echo And `net/http` Routes
 
