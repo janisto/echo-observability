@@ -63,11 +63,179 @@ func TestNewLoggerPresets(t *testing.T) {
 	}
 }
 
+func TestApplicationLoggerProtectsOnlyActiveProviderAliases(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		preset Preset
+		owned  []string
+	}{
+		{name: "default", preset: PresetDefault},
+		{
+			name: "gcp", preset: PresetGCP,
+			owned: []string{"logging.googleapis.com/trace", "logging.googleapis.com/trace_sampled"},
+		},
+		{name: "aws", preset: PresetAWS, owned: []string{"xray_trace_id"}},
+		{name: "azure", preset: PresetAzure, owned: []string{"operation_Id", "operation_ParentId"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var buffer bytes.Buffer
+			logger, err := NewLogger(LoggerConfig{Preset: tt.preset, Writer: &buffer})
+			if err != nil {
+				t.Fatal(err)
+			}
+			logger.Info(
+				"provider aliases",
+				zap.String("level", "application-level"),
+				zap.String("severity", "application-severity"),
+				zap.String("logging.googleapis.com/trace", "application-gcp-trace"),
+				zap.Bool("logging.googleapis.com/trace_sampled", false),
+				zap.String("xray_trace_id", "application-xray"),
+				zap.String("operation_Id", "application-azure-operation"),
+				zap.String("operation_ParentId", "application-azure-parent"),
+				zap.String("httpRequest", "application-http-request"),
+			)
+
+			entry := decodeSingleLogLine(t, buffer.String())
+			want := map[string]any{
+				"logging.googleapis.com/trace":         "application-gcp-trace",
+				"logging.googleapis.com/trace_sampled": false,
+				"xray_trace_id":                        "application-xray",
+				"operation_Id":                         "application-azure-operation",
+				"operation_ParentId":                   "application-azure-parent",
+			}
+			for _, key := range tt.owned {
+				delete(want, key)
+				if _, present := entry[key]; present {
+					t.Fatalf("active %s alias %s was not protected: %#v", tt.name, key, entry)
+				}
+			}
+			assertFields(t, entry, want)
+			if tt.preset == PresetGCP {
+				assertFields(t, entry, map[string]any{
+					"severity": "INFO", "level": "application-level",
+				})
+			} else {
+				assertFields(t, entry, map[string]any{
+					"level": "INFO", "severity": "application-severity",
+				})
+			}
+			if entry["httpRequest"] != "application-http-request" {
+				t.Fatalf("application access-only field was dropped: %#v", entry)
+			}
+		})
+	}
+}
+
+func TestNewLoggerWritesLFTerminatedNDJSONRecords(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger, err := NewLogger(LoggerConfig{Writer: &buffer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	logger.Info("first ✓\nlogical message")
+	logger.Error("second message")
+
+	output := buffer.String()
+	if !strings.HasSuffix(output, "\n") || strings.Contains(output, "\r") {
+		t.Fatalf("output is not LF-terminated NDJSON: %q", output)
+	}
+	lines := strings.Split(strings.TrimSuffix(output, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("physical line count = %d, want 2; output=%q", len(lines), output)
+	}
+	wantMessages := []string{"first ✓\nlogical message", "second message"}
+	for index, line := range lines {
+		var record map[string]any
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("line %d is not one JSON object: %v; line=%q", index, err, line)
+		}
+		if got := record["message"]; got != wantMessages[index] {
+			t.Fatalf("line %d message = %#v, want %q", index, got, wantMessages[index])
+		}
+	}
+}
+
+func TestLoggerWithMetadataPreservesExternalCoreSampling(t *testing.T) {
+	t.Parallel()
+
+	var output bytes.Buffer
+	encoderConfig := zap.NewProductionEncoderConfig()
+	encoderConfig.TimeKey = ""
+	core := zapcore.NewSamplerWithOptions(
+		zapcore.NewCore(
+			zapcore.NewJSONEncoder(encoderConfig),
+			zapcore.AddSync(&output),
+			zapcore.DebugLevel,
+		),
+		time.Hour,
+		1,
+		0,
+	)
+	logger := loggerWithMetadata(
+		zap.New(core),
+		&requestMetadata{RequestID: "req-external-core"},
+		PresetDefault,
+	)
+
+	logger.Info("sampled")
+	logger.Info("sampled")
+
+	lines := strings.Split(strings.TrimSpace(output.String()), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("external sampler wrote %d records, want 1: %q", len(lines), output.String())
+	}
+	var record map[string]any
+	if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("decode sampled record: %v", err)
+	}
+	if got := record["request_id"]; got != "req-external-core" {
+		t.Fatalf("request_id = %#v, want req-external-core", got)
+	}
+}
+
 func TestNewLoggerRejectsUnknownPreset(t *testing.T) {
 	t.Parallel()
 	logger, err := NewLogger(LoggerConfig{Preset: "bogus"})
 	if logger != nil || err == nil || err.Error() != "observability: unknown logger preset" {
 		t.Fatalf("NewLogger(bogus) = (%#v, %v), want nil and exact unknown-preset error", logger, err)
+	}
+}
+
+func TestUnknownPresetIsRejectedAtEveryPublicConstructionBoundary(t *testing.T) {
+	t.Parallel()
+
+	const want = "observability: unknown logger preset"
+	tests := []struct {
+		name      string
+		construct func()
+	}{
+		{name: "access logger", construct: func() { AccessLogger(AccessLoggerConfig{Preset: Preset("bogus")}) }},
+		{name: "request context", construct: func() { RequestContext(RequestContextConfig{Preset: Preset("bogus")}) }},
+		{
+			name: "HTTP request context",
+			construct: func() {
+				HTTPRequestContext(HTTPRequestContextConfig{Preset: Preset("bogus")})
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			defer func() {
+				recovered := recover()
+				err, ok := recovered.(error)
+				if !ok || err.Error() != want {
+					t.Fatalf("%s panic = %#v, want %q", tt.name, recovered, want)
+				}
+			}()
+			tt.construct()
+		})
 	}
 }
 
@@ -90,7 +258,15 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 		{},
 		{
 			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
-			Flags: "01", Sampled: true, Valid: true,
+			Version: "00", Flags: "01", Sampled: true, Level: TraceContextLevel1, Valid: true,
+		},
+		{
+			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
+			Version: "00", Flags: "03", Sampled: true, Random: true, Level: TraceContextLevel2, Valid: true,
+		},
+		{
+			TraceID: "4bf92f3577b34da6a3ce929d0e0e4736", ParentID: "00f067aa0ba902b7",
+			Version: "01", Flags: "03", Sampled: true, Level: TraceContextLevel2, Valid: true,
 		},
 	} {
 		var buffer bytes.Buffer
@@ -98,14 +274,14 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		base.With(requestMetadataFields(&requestMetadata{
+		loggerWithMetadata(base, &requestMetadata{
 			RequestID: "req-1", CorrelationID: "corr-1", Trace: trace,
-		})...).Info("handler")
+		}, PresetDefault).Info("handler")
 		entry := decodeSingleLogLine(t, buffer.String())
 		if entry["request_id"] != "req-1" || entry["correlation_id"] != "corr-1" {
 			t.Fatalf("request metadata fields = %#v", entry)
 		}
-		traceFields := []string{"trace_id", "parent_id", "trace_flags", "trace_sampled"}
+		traceFields := []string{"trace_id", "parent_id", "trace_flags", "trace_sampled", "trace_id_random"}
 		if !trace.Valid {
 			for _, key := range traceFields {
 				if _, ok := entry[key]; ok {
@@ -123,6 +299,13 @@ func TestRequestLoggerFieldsIncludeTraceOnlyWhenValid(t *testing.T) {
 				t.Fatalf("%s = %#v, want %#v; entry=%#v", key, entry[key], value, entry)
 			}
 		}
+		if trace.Level == TraceContextLevel2 && trace.Version == "00" {
+			if entry["trace_id_random"] != trace.Random {
+				t.Fatalf("trace_id_random = %#v, want %#v; entry=%#v", entry["trace_id_random"], trace.Random, entry)
+			}
+		} else if _, ok := entry["trace_id_random"]; ok {
+			t.Fatalf("trace without version 00 Level 2 semantics emitted trace_id_random: %#v", entry)
+		}
 	}
 }
 
@@ -137,8 +320,10 @@ func TestGCPLevelMapping(t *testing.T) {
 		{zapcore.WarnLevel, "WARNING"},
 		{zapcore.ErrorLevel, "ERROR"},
 		{zapcore.DPanicLevel, "CRITICAL"},
-		{zapcore.PanicLevel, "ALERT"},
-		{zapcore.FatalLevel, "EMERGENCY"},
+		{zapcore.PanicLevel, "CRITICAL"},
+		{zapcore.FatalLevel, "CRITICAL"},
+		{zapcore.Level(-99), "DEBUG"},
+		{zapcore.Level(99), "CRITICAL"},
 	}
 	for _, tt := range tests {
 		encoder := zapcore.NewJSONEncoder(zapcore.EncoderConfig{
@@ -272,10 +457,9 @@ func TestLoggerReturnsInstalledRequestLogger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx := contextWithRequestMetadata(context.Background(), &requestMetadata{
-		RequestID: "req-1",
-		Logger:    base.With(zap.String("request_id", "req-1")),
-	})
+	metadata := &requestMetadata{RequestID: "req-1", CorrelationID: "req-1"}
+	metadata.Logger = loggerWithMetadata(base, metadata, PresetDefault)
+	ctx := contextWithRequestMetadata(context.Background(), metadata)
 	Logger(ctx).Info("handler")
 	entry := decodeSingleLogLine(t, buffer.String())
 	if entry["message"] != "handler" || entry["request_id"] != "req-1" {

@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/hex"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/labstack/echo/v5"
 	"go.uber.org/zap"
@@ -44,14 +47,14 @@ func TestDefaultValidateRequestIDEnforcesASCIIAndLengthBoundaries(t *testing.T) 
 func TestRequestContextUsesCustomValidatorAndDefaultsResponseHeader(t *testing.T) {
 	t.Parallel()
 	const header = "X-Custom-Request-Id"
-	const generated = "custom:id"
+	const generated = "generated"
 
 	e := echo.New()
 	e.Use(RequestContext(RequestContextConfig{
 		RequestIDHeader: header,
 		NewRequestID:    func() string { return generated },
 		ValidateRequestID: func(value string) bool {
-			return strings.HasPrefix(value, "custom:")
+			return strings.HasPrefix(value, "custom-")
 		},
 	}))
 	var got string
@@ -68,6 +71,27 @@ func TestRequestContextUsesCustomValidatorAndDefaultsResponseHeader(t *testing.T
 	}
 	if value := rec.Header().Get(defaultRequestIDHeader); value != "" {
 		t.Fatalf("unexpected default response header = %q", value)
+	}
+}
+
+func TestRequestContextCustomValidatorMayBroadenNativeSafeRequestIDs(t *testing.T) {
+	t.Parallel()
+	for _, requestID := range []string{"id:42", strings.Repeat("a", 129), "tenant request", "tenant\trequest", "native-\u0081"} {
+		e := echo.New()
+		e.Use(RequestContext(RequestContextConfig{
+			ValidateRequestID: func(string) bool { return true },
+		}))
+		var got string
+		e.GET("/", func(c *echo.Context) error {
+			got = RequestID(c.Request().Context())
+			return c.NoContent(http.StatusNoContent)
+		})
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+		req.Header.Set(defaultRequestIDHeader, requestID)
+		e.ServeHTTP(httptest.NewRecorder(), req)
+		if got != requestID {
+			t.Fatalf("request ID = %q, want custom-admitted %q", got, requestID)
+		}
 	}
 }
 
@@ -168,8 +192,8 @@ func TestRequestContextTraceAndCustomHeaders(t *testing.T) {
 func TestRequestContextTracestateBoundary(t *testing.T) {
 	t.Parallel()
 	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
-	for _, size := range []int{maxTracestateLen, maxTracestateLen + 1} {
-		tracestate := strings.Repeat("a", size)
+	valid512 := "a=" + strings.Repeat("v", 256) + ",b=" + strings.Repeat("w", 251)
+	for _, tracestate := range []string{valid512, valid512 + "w"} {
 		e := echo.New()
 		e.Use(RequestContext(RequestContextConfig{}))
 		var got string
@@ -181,20 +205,91 @@ func TestRequestContextTracestateBoundary(t *testing.T) {
 		req.Header.Set("Traceparent", traceparent)
 		req.Header.Set("Tracestate", tracestate)
 		e.ServeHTTP(httptest.NewRecorder(), req)
-		want := tracestate
-		if size > maxTracestateLen {
-			want = ""
-		}
-		if got != want {
+		if got != tracestate {
 			t.Fatalf(
 				"size %d: preserved input=%v, got length=%d, want length=%d",
-				size,
+				len(tracestate),
 				got == tracestate,
 				len(got),
-				len(want),
+				len(tracestate),
 			)
 		}
 	}
+}
+
+func TestRequestContextRejectsDuplicateRequestIDAndTraceparentFieldLines(t *testing.T) {
+	t.Parallel()
+	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	tests := []struct {
+		name   string
+		header string
+		values []string
+	}{
+		{name: "identical request IDs", header: defaultRequestIDHeader, values: []string{"caller", "caller"}},
+		{name: "different request IDs", header: defaultRequestIDHeader, values: []string{"caller", "other"}},
+		{name: "identical traceparents", header: defaultTraceparentHeader, values: []string{traceparent, traceparent}},
+		{
+			name:   "different traceparents",
+			header: defaultTraceparentHeader,
+			values: []string{traceparent, strings.Replace(traceparent, "-01", "-00", 1)},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := echo.New()
+			e.Use(RequestContext(RequestContextConfig{NewRequestID: func() string { return "generated" }}))
+			var requestID string
+			var trace TraceContext
+			e.GET("/", func(c *echo.Context) error {
+				requestID = RequestID(c.Request().Context())
+				trace = Trace(c.Request().Context())
+				return c.NoContent(http.StatusNoContent)
+			})
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+			req.Header.Set(defaultRequestIDHeader, "caller")
+			if tt.header == defaultTraceparentHeader {
+				req.Header.Set(defaultRequestIDHeader, "request")
+			}
+			req.Header[http.CanonicalHeaderKey(tt.header)] = append([]string(nil), tt.values...)
+			e.ServeHTTP(httptest.NewRecorder(), req)
+			if tt.header == defaultRequestIDHeader {
+				if requestID != "generated" || trace.Valid {
+					t.Fatalf("duplicate request ID selected: request_id=%q trace=%#v", requestID, trace)
+				}
+				return
+			}
+			if requestID != "request" || trace.Valid {
+				t.Fatalf("duplicate traceparent selected: request_id=%q trace=%#v", requestID, trace)
+			}
+		})
+	}
+}
+
+func TestRequestContextLevel2AndConstructionValidation(t *testing.T) {
+	t.Parallel()
+	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-03"
+	e := echo.New()
+	e.Use(RequestContext(RequestContextConfig{TraceContextLevel: TraceContextLevel2}))
+	var got TraceContext
+	e.GET("/", func(c *echo.Context) error {
+		got = Trace(c.Request().Context())
+		return c.NoContent(http.StatusNoContent)
+	})
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+	req.Header.Set("Traceparent", traceparent)
+	e.ServeHTTP(httptest.NewRecorder(), req)
+	if !got.Valid || got.Level != TraceContextLevel2 || !got.Sampled || !got.Random {
+		t.Fatalf("Level 2 request trace = %#v", got)
+	}
+
+	defer func() {
+		value := recover()
+		if fmt.Sprint(value) != "unsupported trace context level 3: supported levels are 1 and 2" {
+			t.Fatalf("invalid-level panic = %v", value)
+		}
+	}()
+	_ = RequestContext(RequestContextConfig{TraceContextLevel: 3})
 }
 
 func TestRequestContextInstallsZapLogger(t *testing.T) {
@@ -245,22 +340,98 @@ func TestRequestContextPreservesExistingMetadataLogger(t *testing.T) {
 
 func TestNewValidRequestIDUsesSafeDefaultFormatWhenCustomGenerationFails(t *testing.T) {
 	t.Parallel()
+	calls := 0
+	id := newValidRequestID(func() string {
+		calls++
+		return "invalid value"
+	})
+	decoded, err := hex.DecodeString(id)
+	if calls != 1 || err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
+		t.Errorf("calls=%d id=%q decode_error=%v", calls, id, err)
+	}
+}
+
+func TestNativeRequestIDBoundaryAllowsOnlyHTTPFieldText(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"~", "tenant request", "tenant\trequest", "\u0080", "\u00ff"} {
+		if !nativeSafeRequestID(value) {
+			t.Fatalf("native-safe request ID boundary %q was rejected", value)
+		}
+	}
+	for _, value := range []string{"", " ", "\t", " tenant", "tenant ", "\ttenant", "tenant\t", "\x00", "\x1f", "\x7f", "\x80", "\xff"} {
+		if nativeSafeRequestID(value) {
+			t.Fatalf("unsafe request ID boundary %q was accepted", value)
+		}
+	}
+}
+
+func TestCustomRequestIDValidatorRunsOnlyForRFCFieldContent(t *testing.T) {
+	t.Parallel()
+
+	for _, value := range []string{"tenant request", "tenant\trequest", "tenant,request"} {
+		calls := 0
+		if !validIncomingRequestID(value, func(string) bool { calls++; return true }) || calls != 1 {
+			t.Fatalf("valid field content %q: accepted=false or calls=%d", value, calls)
+		}
+	}
+	for _, value := range []string{" tenant", "tenant ", "\x80"} {
+		calls := 0
+		if validIncomingRequestID(value, func(string) bool { calls++; return true }) || calls != 0 {
+			t.Fatalf("unsafe field content %q reached validator %d times", value, calls)
+		}
+	}
+}
+
+func TestRequestIDHookPanicsAreContainedAndPreserveHandler(t *testing.T) {
+	t.Parallel()
+
 	for _, tt := range []struct {
 		name     string
-		validate func(string) bool
+		incoming string
+		config   RequestContextConfig
 	}{
-		{name: "default validator", validate: DefaultValidateRequestID},
-		{name: "validator rejects every candidate", validate: func(string) bool { return false }},
+		{
+			name:     "validator",
+			incoming: "caller",
+			config: RequestContextConfig{
+				NewRequestID: func() string { return "generated" },
+				ValidateRequestID: func(string) bool {
+					panic("validator secret")
+				},
+			},
+		},
+		{
+			name: "generator",
+			config: RequestContextConfig{NewRequestID: func() string {
+				panic("generator secret")
+			}},
+		},
 	} {
-		calls := 0
-		id := newValidRequestID(func() string {
-			calls++
-			return "invalid value"
-		}, tt.validate)
-		decoded, err := hex.DecodeString(id)
-		if calls != 2 || err != nil || len(decoded) != 16 || id != strings.ToLower(id) {
-			t.Errorf("%s: calls=%d id=%q decode_error=%v", tt.name, calls, id, err)
-		}
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			e := echo.New()
+			e.Use(RequestContext(tt.config))
+			handlerCalled := false
+			var got string
+			e.GET("/", func(c *echo.Context) error {
+				handlerCalled = true
+				got = RequestID(c.Request().Context())
+				return c.NoContent(http.StatusNoContent)
+			})
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
+			if tt.incoming != "" {
+				req.Header.Set(defaultRequestIDHeader, tt.incoming)
+			}
+			recorder := httptest.NewRecorder()
+			e.ServeHTTP(recorder, req)
+			if !handlerCalled || !DefaultValidateRequestID(got) {
+				t.Fatalf("handler_called=%v request_id=%q", handlerCalled, got)
+			}
+			if recorder.Header().Get(defaultRequestIDHeader) != got {
+				t.Fatalf("response request ID does not match handler ID: %#v", recorder.Header())
+			}
+		})
 	}
 }
 
@@ -278,6 +449,21 @@ func TestDefaultNewRequestIDProducesUniqueLowercase128BitValues(t *testing.T) {
 			t.Fatalf("generated duplicate request ID %q", id)
 		}
 		seen[id] = struct{}{}
+	}
+}
+
+func TestRandomRequestIDUsesProvidedEntropyAndFallsBackOnReadFailure(t *testing.T) {
+	t.Parallel()
+
+	want := strings.Repeat("ab", 16)
+	if got := randomRequestID(bytes.NewReader(bytes.Repeat([]byte{0xab}, 16))); got != want {
+		t.Fatalf("randomRequestID(success) = %q, want %q", got, want)
+	}
+
+	fallback := randomRequestID(strings.NewReader(""))
+	decoded, err := hex.DecodeString(fallback)
+	if err != nil || len(decoded) != 16 || fallback == want {
+		t.Fatalf("randomRequestID(read failure) = %q, decode_error=%v", fallback, err)
 	}
 }
 
@@ -327,8 +513,8 @@ func TestHTTPRequestContextLifecycle(t *testing.T) {
 			customName: "X-Correlation-Request", responseName: "X-Correlation-Response",
 		},
 		{
-			name: "custom validator", incoming: "client-123", generated: "custom:id", want: "custom:id",
-			validate:      func(value string) bool { return strings.HasPrefix(value, "custom:") },
+			name: "custom validator", incoming: "client-123", generated: "custom-id", want: "custom-id",
+			validate:      func(value string) bool { return strings.HasPrefix(value, "custom-") },
 			wantGenerated: 1,
 		},
 	}
@@ -383,6 +569,80 @@ func TestHTTPRequestContextLifecycle(t *testing.T) {
 	}
 }
 
+type callerContextKey struct{}
+
+func TestRequestContextMiddlewarePreservesCallerValueCancellationAndDeadline(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Echo", func(t *testing.T) {
+		t.Parallel()
+		var buffer bytes.Buffer
+		logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+		parent, deadline := canceledCallerContext(t)
+		e := echo.New()
+		e.Use(RequestContext(RequestContextConfig{Logger: logger}))
+		e.GET("/", func(c *echo.Context) error {
+			assertCallerContextPreserved(t, c.Request().Context(), deadline)
+			Logger(c.Request().Context()).Info("preserved Echo context")
+			return c.NoContent(http.StatusNoContent)
+		})
+		request := httptest.NewRequestWithContext(parent, http.MethodGet, "/", nil)
+		request.Header.Set(defaultRequestIDHeader, "req-preserved-echo")
+		e.ServeHTTP(
+			httptest.NewRecorder(),
+			request,
+		)
+		entry := decodeSingleLogLine(t, buffer.String())
+		assertFields(t, entry, map[string]any{"request_id": "req-preserved-echo"})
+	})
+
+	t.Run("net/http", func(t *testing.T) {
+		t.Parallel()
+		var buffer bytes.Buffer
+		logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+		parent, deadline := canceledCallerContext(t)
+		handler := HTTPRequestContext(HTTPRequestContextConfig{Logger: logger})(http.HandlerFunc(
+			func(_ http.ResponseWriter, request *http.Request) {
+				assertCallerContextPreserved(t, request.Context(), deadline)
+				Logger(request.Context()).Info("preserved HTTP context")
+			},
+		))
+		request := httptest.NewRequestWithContext(parent, http.MethodGet, "/http", nil)
+		request.Header.Set(defaultRequestIDHeader, "req-preserved-http")
+		handler.ServeHTTP(
+			httptest.NewRecorder(),
+			request,
+		)
+		entry := decodeSingleLogLine(t, buffer.String())
+		assertFields(t, entry, map[string]any{"request_id": "req-preserved-http"})
+	})
+}
+
+func canceledCallerContext(t *testing.T) (context.Context, time.Time) {
+	t.Helper()
+	deadline := time.Now().Add(time.Hour)
+	parent, cancel := context.WithDeadline(
+		context.WithValue(context.Background(), callerContextKey{}, "sentinel"),
+		deadline,
+	)
+	cancel()
+	return parent, deadline
+}
+
+func assertCallerContextPreserved(t *testing.T, ctx context.Context, deadline time.Time) {
+	t.Helper()
+	if got := ctx.Value(callerContextKey{}); got != "sentinel" {
+		t.Fatalf("caller context value = %#v, want sentinel", got)
+	}
+	gotDeadline, ok := ctx.Deadline()
+	if !ok || !gotDeadline.Equal(deadline) {
+		t.Fatalf("caller deadline = (%v, %v), want %v", gotDeadline, ok, deadline)
+	}
+	if !errors.Is(ctx.Err(), context.Canceled) {
+		t.Fatalf("caller cancellation = %v, want context.Canceled", ctx.Err())
+	}
+}
+
 func TestHTTPRequestContextTraceAndTracestate(t *testing.T) {
 	t.Parallel()
 	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
@@ -401,10 +661,11 @@ func TestHTTPRequestContextTraceAndTracestate(t *testing.T) {
 			wantTracestate: "vendor=value",
 		},
 		{
-			name:        "overlong state",
-			traceparent: traceparent,
-			tracestate:  strings.Repeat("a", maxTracestateLen+1),
-			wantValid:   true,
+			name:           "513 character state",
+			traceparent:    traceparent,
+			tracestate:     "a=" + strings.Repeat("v", 256) + ",b=" + strings.Repeat("w", 252),
+			wantValid:      true,
+			wantTracestate: "a=" + strings.Repeat("v", 256) + ",b=" + strings.Repeat("w", 252),
 		},
 		{name: "invalid trace", traceparent: "invalid", tracestate: "vendor=value"},
 	}
@@ -478,6 +739,59 @@ func TestHTTPRequestContextInstallsProviderLogger(t *testing.T) {
 		"severity": "INFO", "request_id": "req-http", "correlation_id": "4bf92f3577b34da6a3ce929d0e0e4736",
 		"logging.googleapis.com/trace": "4bf92f3577b34da6a3ce929d0e0e4736",
 	})
+}
+
+func TestHTTPRequestContextPreservesPresetThroughEchoComposition(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Preset: PresetGCP, Writer: &buffer})
+	e := echo.New()
+	e.Use(RequestContext(RequestContextConfig{Logger: logger, Preset: PresetGCP}))
+	handlerCalled := false
+	e.GET("/preset", func(c *echo.Context) error {
+		handlerCalled = true
+		Logger(c.Request().Context()).Info("matching preset handler")
+		return c.NoContent(http.StatusNoContent)
+	})
+	handler := HTTPRequestContext(HTTPRequestContextConfig{
+		Logger: logger,
+		Preset: PresetGCP,
+	})(e)
+	request := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/preset", nil)
+	request.Header.Set(defaultRequestIDHeader, "req-preset-integration")
+	response := httptest.NewRecorder()
+
+	handler.ServeHTTP(response, request)
+
+	if !handlerCalled || response.Code != http.StatusNoContent {
+		t.Fatalf("matching preset composition: handler_called=%v status=%d", handlerCalled, response.Code)
+	}
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{
+		"severity": "INFO", "request_id": "req-preset-integration",
+	})
+}
+
+func TestHTTPRequestContextRejectsPresetMismatchWhenReusingMetadata(t *testing.T) {
+	t.Parallel()
+
+	handler := HTTPRequestContext(HTTPRequestContextConfig{Preset: PresetGCP})(
+		HTTPRequestContext(HTTPRequestContextConfig{Preset: PresetAWS})(
+			http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+				t.Fatal("mismatched nested middleware reached handler")
+			}),
+		),
+	)
+	defer func() {
+		if got := recover(); got != "provider preset mismatch between RequestContext and AccessLogger" {
+			t.Fatalf("preset mismatch panic = %v", got)
+		}
+	}()
+	handler.ServeHTTP(
+		httptest.NewRecorder(),
+		httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil),
+	)
 }
 
 func TestHTTPRequestContextMetadataReuseAndImmutability(t *testing.T) {
@@ -583,5 +897,33 @@ func TestRequestContextInstallsLoggerWithoutMutatingExistingMetadata(t *testing.
 	})
 	if metadata.Logger != nil {
 		t.Fatal("input metadata was mutated")
+	}
+}
+
+func TestRequestContextCompletesEmptyMetadataWithConfiguredLogger(t *testing.T) {
+	t.Parallel()
+
+	var buffer bytes.Buffer
+	logger := newTestLogger(t, LoggerConfig{Writer: &buffer})
+	metadata := &requestMetadata{}
+	ctx := contextWithRequestMetadata(context.Background(), metadata)
+	e := echo.New()
+	e.Use(RequestContext(RequestContextConfig{
+		Logger:       logger,
+		NewRequestID: func() string { return "generated-empty" },
+	}))
+	e.GET("/", func(c *echo.Context) error {
+		Logger(c.Request().Context()).Info("completed empty metadata")
+		return nil
+	})
+	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(ctx, http.MethodGet, "/", nil))
+	entry := decodeSingleLogLine(t, buffer.String())
+	assertFields(t, entry, map[string]any{
+		"message":        "completed empty metadata",
+		"request_id":     "generated-empty",
+		"correlation_id": "generated-empty",
+	})
+	if metadata.RequestID != "" || metadata.CorrelationID != "" || metadata.Logger != nil {
+		t.Fatalf("input metadata was mutated: %#v", metadata)
 	}
 }

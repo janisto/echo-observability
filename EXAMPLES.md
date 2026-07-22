@@ -21,7 +21,8 @@ Every service follows the same shape:
 
 1. Create one logger with the selected preset.
 2. Install `RequestContext` before `AccessLogger` with the same logger and preset.
-3. Install recovery after `AccessLogger` when panics must be logged first.
+3. Install recovery before `AccessLogger` so access logging observes and
+   rethrows panics before recovery turns them into application responses.
 4. Use `obs.Logger(ctx)` in handlers and services.
 5. Add service-specific fields directly to application logs; they do not leak
    into the separate access record.
@@ -43,11 +44,11 @@ e.Use(
 		Logger: logger,
 		Preset: obs.PresetGCP,
 	}),
+	middleware.Recover(),
 	obs.AccessLogger(obs.AccessLoggerConfig{
 		Logger: logger,
 		Preset: obs.PresetGCP,
 	}),
-	middleware.Recover(),
 )
 ```
 
@@ -74,7 +75,8 @@ The request ID remains `demo-123`; `correlation_id` becomes the W3C trace ID.
 The info-level health record, debug-level dependency record, and terminal
 access record contain the same correlation fields. Application records retain
 developer-defined service fields. The access record remains separate and
-contains `httpRequest`, `/health` as the route template, and status 200.
+contains `httpRequest`, `/health` as the route template, `health_check` as the
+operation ID, and status 200.
 
 The runnable GCP example opts into debug output. `NewLogger` defaults to info,
 which suppresses the dependency record and its fields while preserving the
@@ -83,13 +85,26 @@ health and access records.
 Representative GCP fields:
 
 ```json
-{"severity":"INFO","message":"health check","request_id":"demo-123","correlation_id":"4bf92f3577b34da6a3ce929d0e0e4736","service_name":"example-service","health_status":"ok"}
+{"severity":"INFO","message":"health check","request_id":"demo-123","correlation_id":"4bf92f3577b34da6a3ce929d0e0e4736","service_name":"example-service","service_version":"1.0.0","health_status":"ok"}
 {"severity":"DEBUG","message":"dependency check","request_id":"demo-123","correlation_id":"4bf92f3577b34da6a3ce929d0e0e4736","dependency":"database","dependency_status":"ok","check_duration_ms":3}
-{"severity":"INFO","message":"request completed","request_id":"demo-123","correlation_id":"4bf92f3577b34da6a3ce929d0e0e4736","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","logging.googleapis.com/trace":"4bf92f3577b34da6a3ce929d0e0e4736","logging.googleapis.com/trace_sampled":true,"method":"GET","path":"/health","path_template":"/health","status":200}
+{"severity":"INFO","message":"request completed","request_id":"demo-123","correlation_id":"4bf92f3577b34da6a3ce929d0e0e4736","trace_id":"4bf92f3577b34da6a3ce929d0e0e4736","logging.googleapis.com/trace":"4bf92f3577b34da6a3ce929d0e0e4736","logging.googleapis.com/trace_sampled":true,"method":"GET","duration_ms":12.5,"path_template":"/health","operation_id":"health_check","status":200,"httpRequest":{"requestMethod":"GET","status":200,"latency":"0.012500s"}}
 ```
 
 The package does not create spans and therefore does not manufacture
 `logging.googleapis.com/spanId` from the incoming parent ID.
+
+W3C Trace Context Level 1 is the default. To enable the pinned Level 2 mode,
+configure `TraceContextLevel2` on both `RequestContext` and `AccessLogger`.
+Level 2 adds `trace_id_random`, derived from bit one of the preserved
+two-character `trace_flags`. Unsupported levels fail at middleware
+construction. Duplicate request-ID or `traceparent` field-lines are rejected
+as ambiguous, and `tracestate` is retained only after complete selected-level
+grammar, duplicate-key, and 32-member validation. A valid value is not rejected
+merely because it exceeds the 512-character minimum propagation capacity.
+
+Raw path, direct peer IP, and user agent are disabled by default and have
+independent access-log opt-ins. GCP does not change those defaults. Captured
+GCP `requestUrl` is path-only.
 
 ## Provider-Neutral JSON
 
@@ -174,3 +189,4 @@ levels, and error information.
 - [Google Cloud Trace release notes](https://docs.cloud.google.com/trace/docs/release-notes)
 - [Google Cloud structured logging](https://cloud.google.com/logging/docs/structured-logging)
 - [W3C Trace Context](https://www.w3.org/TR/trace-context/)
+- [W3C Trace Context Level 2](https://www.w3.org/TR/2024/CRD-trace-context-2-20240328/)

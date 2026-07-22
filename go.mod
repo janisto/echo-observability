@@ -1,4 +1,4 @@
-module github.com/janisto/echo-observability
+module github.com/janisto/echo-observability/v2
 
 go 1.25.0
 

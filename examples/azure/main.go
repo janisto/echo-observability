@@ -7,7 +7,7 @@ import (
 	"github.com/labstack/echo/v5/middleware"
 	"go.uber.org/zap"
 
-	"github.com/janisto/echo-observability"
+	"github.com/janisto/echo-observability/v2"
 )
 
 func main() {
@@ -19,8 +19,8 @@ func main() {
 	e := echo.New()
 	e.Use(
 		obs.RequestContext(obs.RequestContextConfig{Logger: logger, Preset: obs.PresetAzure}),
-		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger, Preset: obs.PresetAzure}),
 		middleware.Recover(),
+		obs.AccessLogger(obs.AccessLoggerConfig{Logger: logger, Preset: obs.PresetAzure}),
 	)
 	e.GET("/health", func(c *echo.Context) error {
 		obs.Logger(c.Request().Context()).Info("health check")
