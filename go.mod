@@ -3,7 +3,7 @@ module github.com/janisto/echo-observability/v2
 go 1.25.0
 
 require (
-	github.com/labstack/echo/v5 v5.2.0
+	github.com/labstack/echo/v5 v5.4.1
 	go.uber.org/zap v1.28.0
 )
 
