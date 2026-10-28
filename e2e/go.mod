@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/janisto/echo-observability/v2 v2.0.0
-	github.com/labstack/echo/v5 v5.3.0
+	github.com/labstack/echo/v5 v5.4.1
 	go.uber.org/zap v1.28.0
 )
 
